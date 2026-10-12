@@ -1,0 +1,16 @@
+[package]
+name = "utopia-query"
+description = "Queries as data, compiled to SQL (MySQL, MariaDB, PostgreSQL, SQLite, ClickHouse) and MongoDB commands; schema builders; a SQL tokenizer, parser, serializer and statement classifier."
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "BSD-3-Clause"
+
+[dependencies]
+md-5 = "0.10"
+php-std = { version = "0.1.0", git = "https://github.com/utopia-rs/php-std" }
+thiserror = "2"
+
+[package.metadata.utopia]
+category = "data"
+php-sync = "da0119eda7c139b8f99b13d814e5a99f9b5ac418"
