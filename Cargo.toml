@@ -13,4 +13,4 @@ thiserror = "2"
 
 [package.metadata.utopia]
 category = "data"
-php-sync = "da0119eda7c139b8f99b13d814e5a99f9b5ac418"
+php-sync = "060ac994a1919f4fb35249407abb941fb5ffa5de"
