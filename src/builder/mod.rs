@@ -28,10 +28,12 @@
 
 mod api;
 mod ast;
+pub use ast::AstWriter;
 mod case;
 mod clickhouse;
 mod core;
 pub mod feature;
+mod flavor;
 mod join;
 mod mariadb;
 mod mongodb;
@@ -39,6 +41,7 @@ mod mysql;
 mod postgresql;
 mod sql;
 mod sqlite;
+mod steps;
 mod types;
 
 use std::any::Any;
@@ -49,6 +52,7 @@ pub use core::{
     AfterBuild, BeforeBuild, Builder, Core, Dialect, ExistsSubquery, ExplainOptions, LateralJoin, SubSelect,
     WhereInSubquery,
 };
+pub use flavor::{Flavor, IdCollation, ObjectPathCheck, Scope, ScopeBinding, SqliteFlavor};
 pub use join::JoinBuilder;
 pub use mariadb::{MariaDb, MariaDbDialect};
 pub use mongodb::{IndexHint, MongoDb, MongoDbDialect, Operation, PipelineStage, UpdateOperation, UpdateOperator};
@@ -56,6 +60,7 @@ pub use mysql::{MySql, MySqlDialect, MySqlFamily, MySqlState};
 pub use postgresql::{DeleteUsing, MergeTarget, PostgreSql, PostgreSqlDialect, UpdateFrom};
 pub use sql::{SqlDialect, geometry_to_wkt};
 pub use sqlite::{Sqlite, SqliteDialect};
+pub use steps::{Arg, Overrides, Ret, Step};
 pub use types::{
     Binding, ColumnPredicate, Condition, CteClause, Executor, JoinOn, JoinType, LockMode, MergeClause,
     SpatialDistanceFilter, Statement, UnionClause, UnionType, VectorMetric, WindowDefinition, WindowFrame,

@@ -44,6 +44,7 @@ pub struct Query {
     on_array: bool,
     values: Array,
     alias: String,
+    alias_defaulted: bool,
 }
 
 /// The queries grouped by what they do, as builders compile them.
@@ -193,14 +194,10 @@ impl Query {
     ///
     /// PHP: `new Query($method, $attribute, $values, $alias)`.
     pub fn new(method: Method, attribute: impl Into<String>, values: Array, alias: impl Into<String>) -> Self {
-        Query {
-            method,
-            attribute: attribute.into(),
-            attribute_type: String::new(),
-            on_array: false,
-            values,
-            alias: alias.into(),
-        }
+        let attribute = attribute.into();
+        let alias = alias.into();
+        let alias_defaulted = method.is_join() && !alias.is_empty() && alias == attribute;
+        Query { method, attribute, attribute_type: String::new(), on_array: false, values, alias, alias_defaulted }
     }
 
     fn of(method: Method, attribute: impl Into<String>, values: Vec<Value>) -> Self {
@@ -240,6 +237,15 @@ impl Query {
     /// PHP: `getAlias()`.
     pub fn alias(&self) -> &str {
         &self.alias
+    }
+
+    /// Whether a join is read under the name of the collection it joins, as
+    /// a join given no alias is. Decided when the query is built, so it
+    /// holds after the collection is renamed.
+    ///
+    /// PHP: `isAliasDefaulted()`.
+    pub fn is_alias_defaulted(&self) -> bool {
+        self.alias_defaulted
     }
 
     /// Whether the attribute holds arrays (set by the database layer).
@@ -420,6 +426,12 @@ impl Query {
             ));
         }
 
+        if method == Method::Distinct && (!attribute.is_empty() || !values.is_empty()) {
+            return Err(Error::query(
+                "Invalid distinct query: distinct takes no attribute or values, it deduplicates the attributes a select names",
+            ));
+        }
+
         if method.is_join() {
             return Query::parse_join(method, attribute, &values, alias, allow_raw);
         }
@@ -437,7 +449,7 @@ impl Query {
             let mut parsed = Array::with_capacity(values.len());
             for (key, value) in values.iter() {
                 let child =
-                    Param::method("Utopia\\Query\\Query::parseQuery", 1, "query", "Query.php", 268).array(value)?;
+                    Param::method("Utopia\\Query\\Query::parseQuery", 1, "query", "Query.php", 285).array(value)?;
                 parsed.set(key.to_owned(), Value::from(Query::parse_query(child, allow_raw)?));
             }
             values = parsed;
@@ -522,7 +534,7 @@ impl Query {
     ///
     /// PHP: `shape()`.
     pub fn shape(&self) -> String {
-        let logical = matches!(self.method, Method::And | Method::Or | Method::ElemMatch);
+        let logical = matches!(self.method, Method::And | Method::Or | Method::ElemMatch | Method::Relationship);
         if !logical && !self.is_nested_join() {
             return format!("{}:{}", self.method.as_str(), self.attribute);
         }
@@ -885,17 +897,13 @@ impl Query {
             match method {
                 Method::OrderAsc | Method::OrderDesc | Method::OrderRandom => {}
                 Method::Limit => {
-                    if parsed.limit.is_none()
-                        && let Some(v) = first.filter(|v| is_numeric(v))
-                    {
-                        parsed.limit = Some(intval(v));
+                    if parsed.limit.is_none() {
+                        parsed.limit = first.and_then(to_integer);
                     }
                 }
                 Method::Offset => {
-                    if parsed.offset.is_none()
-                        && let Some(v) = first.filter(|v| is_numeric(v))
-                    {
-                        parsed.offset = Some(intval(v));
+                    if parsed.offset.is_none() {
+                        parsed.offset = first.and_then(to_integer);
                     }
                 }
                 Method::CursorAfter | Method::CursorBefore => {
@@ -1085,6 +1093,26 @@ impl Query {
     /// PHP: `Query::elemMatch()`.
     pub fn elem_match(attribute: impl Into<String>, queries: impl IntoIterator<Item = Query>) -> Self {
         Query::new(Method::ElemMatch, attribute, self::queries(queries), "")
+    }
+
+    /// `relationship`: queries, written against the related collection,
+    /// that shape the documents populated for the relationship attribute.
+    /// It is nested, and `validate()` skips it: its queries name another
+    /// collection's attributes.
+    ///
+    /// ```
+    /// use utopia_query::{Method, Query};
+    ///
+    /// let query = Query::relationship("books", [Query::limit(2)]);
+    /// assert_eq!(query.method(), Method::Relationship);
+    /// assert!(Method::Relationship.is_nested());
+    /// assert_eq!(query.shape(), "relationship:books(limit:)");
+    /// assert!(Query::validate(&[query], &["title"]).unwrap().is_empty());
+    /// ```
+    ///
+    /// PHP: `Query::relationship()`.
+    pub fn relationship(attribute: impl Into<String>, queries: impl IntoIterator<Item = Query>) -> Self {
+        Query::new(Method::Relationship, attribute, self::queries(queries), "")
     }
 
     fn aggregate(method: Method, attribute: impl Into<String>, alias: impl Into<String>) -> Self {
@@ -1295,6 +1323,7 @@ impl Query {
         let mut conditions = Vec::with_capacity(on.len());
         let collection = collection.into();
         let alias = alias.into();
+        let alias = if alias.is_empty() { collection.clone() } else { alias };
         Query::check_join_alias(method, &collection, &alias, on.is_empty())?;
         for value in on.values() {
             match value {
@@ -1307,6 +1336,7 @@ impl Query {
 
     fn check_join_alias(method: Method, collection: &str, alias: &str, empty: bool) -> Result<()> {
         if alias.is_empty() {
+            // Only when the collection is empty too: an empty alias reads as the collection.
             return Err(Error::Validation(format!("Join alias is required: {} {}", method.as_str(), collection)));
         }
         let unconditioned = method == Method::CrossJoin || method == Method::NaturalJoin;
@@ -1319,7 +1349,9 @@ impl Query {
         Ok(())
     }
 
+    /// A join given no alias is read under the collection it joins.
     fn create_join(method: Method, collection: String, alias: String, on: Vec<Query>) -> Result<Self> {
+        let alias = if alias.is_empty() { collection.clone() } else { alias };
         Query::check_join_alias(method, &collection, &alias, on.is_empty())?;
         for condition in &on {
             Query::assert_join_condition(condition)?;
@@ -1493,14 +1525,25 @@ impl Query {
         use Method::*;
         for query in queries {
             let method = query.method;
-            if method.is_nested() {
-                Query::validate_into(query.nested(), allowed, errors)?;
-                continue;
-            }
+            // A relationship's queries name the related collection's
+            // attributes: skipped before nested queries are walked.
             if matches!(
                 method,
-                Limit | Offset | CursorAfter | CursorBefore | OrderRandom | Distinct | Select | Exists | NotExists
+                Limit
+                    | Offset
+                    | CursorAfter
+                    | CursorBefore
+                    | OrderRandom
+                    | Distinct
+                    | Select
+                    | Exists
+                    | NotExists
+                    | Relationship
             ) {
+                continue;
+            }
+            if method.is_nested() {
+                Query::validate_into(query.nested(), allowed, errors)?;
                 continue;
             }
             if method == GroupBy {
@@ -1550,17 +1593,27 @@ pub(crate) fn is_numeric(value: &Value) -> bool {
     }
 }
 
-/// `intval($value)`.
-pub(crate) fn intval(value: &Value) -> i64 {
-    match value {
-        Value::Int(i) => *i,
-        Value::Float(f) => php_std::format::dval_to_lval(*f),
-        Value::Str(s) => php_std::format::Arg::Str(s.as_bytes()).to_int(),
-        Value::Bool(b) => *b as i64,
-        Value::Null => 0,
-        Value::Array(a) => !a.is_empty() as i64,
-        Value::Object(_) | Value::Ext(_) => 1,
+/// PHP's `Query::toInteger()`: an integer, an integral numeric string, or
+/// a finite number in range, truncated; `None` for anything else.
+fn to_integer(value: &Value) -> Option<i64> {
+    use php_std::filter as f;
+    let text = match value {
+        Value::Int(i) => return Some(*i),
+        _ if !is_numeric(value) => return None,
+        Value::Float(x) => f::Value::Float(*x),
+        Value::Str(s) => f::Value::Str(s.as_bytes().to_vec()),
+        _ => return None,
+    };
+    if let Ok(f::Filtered { value: f::Value::Int(i), .. }) =
+        f::filter_var(&text, f::FILTER_VALIDATE_INT, &f::Options::Flags(0))
+    {
+        return Some(i);
     }
+    let number = value.to_double();
+    if !number.is_finite() || number < i64::MIN as f64 || number >= i64::MAX as f64 {
+        return None;
+    }
+    Some(number as i64)
 }
 
 /// PHP's `sort()` order for strings (`zend_compare` on two strings: numeric

@@ -6,7 +6,7 @@ use crate::value::{IntoValue, IntoValues};
 
 const OPERATORS: [&str; 7] = ["=", "!=", "<", ">", "<=", ">=", "<>"];
 
-/// `/^[a-zA-Z_][a-zA-Z0-9_.]*$/` (where `$` also matches before a final newline).
+/// `/^[a-zA-Z_][a-zA-Z0-9_.]*$/D`.
 pub(crate) fn is_identifier_path(name: &str) -> bool {
     crate::hook::is_column_name(name)
 }
@@ -44,11 +44,15 @@ impl JoinBuilder {
         Ok(self)
     }
 
-    /// A raw ON condition with its bindings.
+    /// A raw ON condition with its bindings, enclosed in parentheses like
+    /// `where_raw()`.
     ///
     /// PHP: `onRaw()`.
     pub fn on_raw(&mut self, expression: impl Into<String>, bindings: impl IntoValues) -> &mut Self {
-        self.wheres.push(Condition::new(expression, bindings.into_values().values().cloned().collect()));
+        self.wheres.push(Condition::new(
+            format!("({})", expression.into()),
+            bindings.into_values().values().cloned().collect(),
+        ));
         self
     }
 
@@ -66,11 +70,29 @@ impl JoinBuilder {
         Ok(self)
     }
 
-    /// A raw condition with its bindings.
+    /// A raw condition for the join's ON clause, enclosed in parentheses:
+    /// the ON conditions are joined with AND, so an OR inside a bare
+    /// `a = b OR 1 = 1` would escape the other conditions, including those a
+    /// join-filter hook adds.
     ///
     /// PHP: `whereRaw()`.
     pub fn where_raw(&mut self, expression: impl Into<String>, bindings: impl IntoValues) -> &mut Self {
-        self.wheres.push(Condition::new(expression, bindings.into_values().values().cloned().collect()));
+        self.wheres.push(Condition::new(
+            format!("({})", expression.into()),
+            bindings.into_values().values().cloned().collect(),
+        ));
+        self
+    }
+
+    /// Adds a comparison and a condition as they are, for a join whose conditions were
+    /// checked where they were written (PHP's `JoinBuilder`).
+    pub fn push(
+        &mut self,
+        ons: impl IntoIterator<Item = JoinOn>,
+        wheres: impl IntoIterator<Item = Condition>,
+    ) -> &mut Self {
+        self.ons.extend(ons);
+        self.wheres.extend(wheres);
         self
     }
 

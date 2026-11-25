@@ -8,7 +8,7 @@ use php_std::ArrayKey;
 use php_std::json::Flags;
 
 use crate::builder::AnyBuilder;
-use crate::builder::core::{Builder, Dialect, ExplainOptions, first};
+use crate::builder::core::{Builder, Dialect, ExplainOptions, enclose, first, quote_bytes};
 use crate::builder::feature::{
     BitwiseAggregates, ConditionalAggregates, CrossJoins, Cube, FullOuterJoins, FullTextSearch, InsertOrIgnore, Json,
     LateralJoins, Locking, NegatedFullTextSearch, RawSql, Returning, Rollup, Sequences, Spatial, StatisticalAggregates,
@@ -120,9 +120,9 @@ pub(crate) fn json_binding(value: &Value) -> Value {
     }
 }
 
-/// `/^[a-zA-Z0-9_.\[\]]+$/` (where `$` also matches before a final newline).
+/// `/^[a-zA-Z0-9_.\[\]]+$/D`.
 pub(crate) fn is_json_path(path: &str) -> bool {
-    let bytes = path.strip_suffix('\n').unwrap_or(path).as_bytes();
+    let bytes = path.as_bytes();
     !bytes.is_empty() && bytes.iter().all(|&b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'[' | b']'))
 }
 
@@ -232,6 +232,11 @@ fn quote_json_key(key: &str) -> Result<String> {
 impl Builder<PostgreSqlDialect> {
     /// `"col"->'a'->>'b'` for `col.a.b`.
     fn jsonb_path(&mut self, path: &str) -> Result<String> {
+        self.step_string(crate::builder::Step::BuildJsonbPath, &[crate::builder::Arg::Str(path)])
+    }
+
+    /// The builder's own `buildJsonbPath()`.
+    fn base_jsonb_path(&mut self, path: &str) -> Result<String> {
         let mut parts: Vec<&str> = path.split('.').collect();
         if parts.len() == 1 {
             return self.resolve_and_wrap(parts[0]);
@@ -248,7 +253,16 @@ impl Builder<PostgreSqlDialect> {
         Ok(chain)
     }
 
-    fn jsonb_containment(&mut self, attribute: &str, values: &Array, not: bool, wrap_scalars: bool) -> String {
+    fn jsonb_containment(&mut self, attribute: &str, values: &Array, not: bool, wrap_scalars: bool) -> Result<String> {
+        use crate::builder::{Arg, Step};
+        self.step_string(
+            Step::CompileJsonbContainment,
+            &[Arg::Str(attribute), Arg::Values(values), Arg::Bool(not), Arg::Bool(wrap_scalars)],
+        )
+    }
+
+    /// The builder's own `compileJsonbContainment()`.
+    fn base_jsonb_containment(&mut self, attribute: &str, values: &Array, not: bool, wrap_scalars: bool) -> String {
         let mut conditions = Vec::with_capacity(values.len());
         for value in values.values() {
             let mut value = value.clone();
@@ -271,6 +285,11 @@ impl Builder<PostgreSqlDialect> {
     }
 
     fn object_filter(&mut self, query: &Query) -> Result<String> {
+        self.step_string(crate::builder::Step::CompileObjectFilter, &[crate::builder::Arg::Query(query)])
+    }
+
+    /// The builder's own `compileObjectFilter()`.
+    fn base_object_filter(&mut self, query: &Query) -> Result<String> {
         let method = query.method();
         let raw = query.attribute();
         let values = query.values();
@@ -280,10 +299,10 @@ impl Builder<PostgreSqlDialect> {
             return match method {
                 Equal => self.compile_in(&attribute, values, None),
                 NotEqual => self.compile_not_in(&attribute, values, None),
-                LessThan => Ok(self.compile_comparison(&attribute, "<", values, None)),
-                LessThanEqual => Ok(self.compile_comparison(&attribute, "<=", values, None)),
-                GreaterThan => Ok(self.compile_comparison(&attribute, ">", values, None)),
-                GreaterThanEqual => Ok(self.compile_comparison(&attribute, ">=", values, None)),
+                LessThan => self.compile_comparison(&attribute, "<", values, None),
+                LessThanEqual => self.compile_comparison(&attribute, "<=", values, None),
+                GreaterThan => self.compile_comparison(&attribute, ">", values, None),
+                GreaterThanEqual => self.compile_comparison(&attribute, ">=", values, None),
                 StartsWith => PostgreSqlDialect::compile_like(self, &attribute, values, "", "%", false, None),
                 NotStartsWith => PostgreSqlDialect::compile_like(self, &attribute, values, "", "%", true, None),
                 EndsWith => PostgreSqlDialect::compile_like(self, &attribute, values, "%", "", false, None),
@@ -298,9 +317,9 @@ impl Builder<PostgreSqlDialect> {
         let attribute = self.resolve_and_wrap(raw)?;
         let text = format!("{attribute}::text");
         match method {
-            Equal | NotEqual => Ok(self.jsonb_containment(&attribute, values, method == NotEqual, false)),
+            Equal | NotEqual => self.jsonb_containment(&attribute, values, method == NotEqual, false),
             Contains | ContainsAny | ContainsAll | NotContains => {
-                Ok(self.jsonb_containment(&attribute, values, method == NotContains, true))
+                self.jsonb_containment(&attribute, values, method == NotContains, true)
             }
             StartsWith => PostgreSqlDialect::compile_like(self, &text, values, "", "%", false, None),
             NotStartsWith => PostgreSqlDialect::compile_like(self, &text, values, "", "%", true, None),
@@ -322,17 +341,14 @@ impl Builder<PostgreSqlDialect> {
         format!("({attribute} {operator} ?::vector)")
     }
 
-    /// Appends `extra` to the trailing `WHERE` of `parts`, or adds one.
-    fn merge_into_where(parts: &mut Vec<String>, extra: Vec<String>) {
-        if extra.is_empty() {
-            return;
-        }
+    /// Appends `condition` to the trailing `WHERE` of `parts`, or adds one.
+    fn merge_into_where(parts: &mut Vec<String>, condition: String) {
         match parts.last_mut() {
             Some(last) if last.starts_with("WHERE ") => {
                 last.push_str(" AND ");
-                last.push_str(&extra.join(" AND "));
+                last.push_str(&condition);
             }
-            _ => parts.push(format!("WHERE {}", extra.join(" AND "))),
+            _ => parts.push(format!("WHERE {condition}")),
         }
     }
 
@@ -351,15 +367,16 @@ impl Builder<PostgreSqlDialect> {
             from_clause.push_str(" AS ");
             from_clause.push_str(&self.quote(&from.alias)?);
         }
-        let mut parts =
-            vec![format!("UPDATE {} SET {} FROM {from_clause}", self.quote(&self.core.table)?, assignments.join(", "))];
-        let mut extra = Vec::new();
+        let mut parts = vec![format!(
+            "UPDATE {} SET {} FROM {from_clause}",
+            self.quote(&self.core.table.clone())?,
+            assignments.join(", ")
+        )];
+        self.compile_where_clauses(&mut parts, None)?;
         if !from.condition.is_empty() {
-            extra.push(from.condition);
+            Self::merge_into_where(&mut parts, enclose(&from.condition));
             self.add_bindings(from.bindings);
         }
-        self.compile_where_clauses(&mut parts, None)?;
-        Self::merge_into_where(&mut parts, extra);
         Ok(self.statement(parts.join(" ")))
     }
 
@@ -370,14 +387,12 @@ impl Builder<PostgreSqlDialect> {
             return Err(Error::Validation("No DELETE USING target specified.".into()));
         };
         let mut parts =
-            vec![format!("DELETE FROM {} USING {}", self.quote(&self.core.table)?, self.quote(&using.table)?)];
-        let mut extra = Vec::new();
+            vec![format!("DELETE FROM {} USING {}", self.quote(&self.core.table.clone())?, self.quote(&using.table)?)];
+        self.compile_where_clauses(&mut parts, None)?;
         if !using.condition.is_empty() {
-            extra.push(using.condition);
+            Self::merge_into_where(&mut parts, enclose(&using.condition));
             self.add_bindings(using.bindings);
         }
-        self.compile_where_clauses(&mut parts, None)?;
-        Self::merge_into_where(&mut parts, extra);
         Ok(self.statement(parts.join(" ")))
     }
 
@@ -386,8 +401,10 @@ impl Builder<PostgreSqlDialect> {
     ///
     /// PHP: `updateFrom()`.
     pub fn update_from(&mut self, table: impl Into<String>, alias: impl Into<String>) -> &mut Self {
+        let table = table.into();
+        self.defer_unbound(&format!("update from table '{table}'"));
         let current = self.dialect.update_from.take().unwrap_or_default();
-        self.dialect.update_from = Some(UpdateFrom { table: table.into(), alias: alias.into(), ..current });
+        self.dialect.update_from = Some(UpdateFrom { table, alias: alias.into(), ..current });
         self
     }
 
@@ -413,8 +430,10 @@ impl Builder<PostgreSqlDialect> {
         condition: impl Into<String>,
         bindings: impl IntoValues,
     ) -> &mut Self {
+        let table = table.into();
+        self.defer_unbound(&format!("delete using table '{table}'"));
         self.dialect.delete_using = Some(DeleteUsing {
-            table: table.into(),
+            table,
             condition: condition.into(),
             bindings: bindings.into_values().values().cloned().collect(),
         });
@@ -651,6 +670,32 @@ fn select_keyword_len(query: &str) -> Option<usize> {
 impl Dialect for PostgreSqlDialect {
     const CLASS: &'static str = "Utopia\\Query\\Builder\\PostgreSQL";
     const WRAP: char = '"';
+    const LITERAL: crate::StringLiteral = crate::StringLiteral::Extended;
+
+    fn base_step(
+        b: &mut Builder<Self>,
+        step: crate::builder::Step,
+        arguments: &[crate::builder::Arg<'_>],
+    ) -> Option<Result<crate::builder::Ret>> {
+        sql::sql_base_step(b, step, arguments)
+            .or_else(|| crate::builder::feature::aggregates_base_step::<Self>(step, arguments))
+            .or_else(|| {
+                use crate::builder::{Arg, Ret, Step};
+                Some(match (step, arguments) {
+                    (Step::CompileObjectFilter, [Arg::Query(query)]) => b.base_object_filter(query).map(Ret::Str),
+                    (
+                        Step::CompileJsonbContainment,
+                        [Arg::Str(attribute), Arg::Values(values), Arg::Bool(not), Arg::Bool(wrap)],
+                    ) => Ok(Ret::Str(b.base_jsonb_containment(attribute, values, *not, *wrap))),
+                    (Step::BuildJsonbPath, [Arg::Str(path)]) => b.base_jsonb_path(path).map(Ret::Str),
+                    _ => return None,
+                })
+            })
+    }
+
+    fn quote_string(value: &[u8]) -> Vec<u8> {
+        quote_bytes(value, false)
+    }
 
     fn compile_random(_b: &Builder<Self>) -> String {
         "RANDOM()".into()
@@ -661,7 +706,25 @@ impl Dialect for PostgreSqlDialect {
         Ok(format!("{attribute} ~ ?"))
     }
 
+    fn compile_contains_all(
+        b: &mut Builder<Self>,
+        attribute: &str,
+        values: &Array,
+        column: Option<&str>,
+    ) -> Result<String> {
+        if let Some(sql) = b.flavored_contains_all(attribute, values, column) {
+            return Ok(sql);
+        }
+        b.base_compile_contains_all(attribute, values, column)
+    }
+
     fn compile_filter(b: &mut Builder<Self>, query: &Query) -> Result<String> {
+        if query.attribute_type() == "object"
+            && query.attribute().contains('.')
+            && let Some(check) = b.core.flavor.object_path.clone()
+        {
+            check(query.attribute())?;
+        }
         let method = query.method();
         if method.is_vector() {
             let attribute = b.resolve_and_wrap(query.attribute())?;
@@ -762,7 +825,7 @@ impl Dialect for PostgreSqlDialect {
         if !["", "TEXT", "XML", "JSON", "YAML"].contains(&format.as_str()) {
             return Err(Error::Validation(format!("Invalid EXPLAIN format: {}", options.format)));
         }
-        let result = Self::build(b)?;
+        let result = b.built()?;
         let mut flags = Vec::new();
         if analyze {
             flags.push("ANALYZE".to_owned());
@@ -788,8 +851,8 @@ impl Dialect for PostgreSqlDialect {
 
     fn reset(b: &mut Builder<Self>) {
         b.core.json_sets.clear();
-        b.core.returning.clear();
-        b.core.group_by_modifier = None;
+        b.reset_returning();
+        b.reset_group_by_modifier();
         b.dialect = PostgreSqlDialect::default();
     }
 
@@ -800,7 +863,19 @@ impl Dialect for PostgreSqlDialect {
 
 impl SqlDialect for PostgreSqlDialect {
     fn compile_search_expression(b: &mut Builder<Self>, attribute: &str, values: &Array, not: bool) -> Result<String> {
-        search_expression(b, attribute, values, not)
+        match b.flavored_search_values(values) {
+            Some(values) => search_expression(b, attribute, &values, not),
+            None => search_expression(b, attribute, values, not),
+        }
+    }
+
+    fn compile_spatial_filter(b: &mut Builder<Self>, method: Method, attribute: &str, query: &Query) -> Result<String> {
+        if method == Method::DistanceLessThan
+            && let Some(srid) = b.core.flavor.indexed_distance
+        {
+            return b.indexed_distance(attribute, query, srid);
+        }
+        sql::sql_compile_spatial_filter(b, method, attribute, query)
     }
 
     fn compile_spatial_distance(
@@ -809,9 +884,10 @@ impl SqlDialect for PostgreSqlDialect {
         attribute: &str,
         values: &Array,
     ) -> Result<String> {
-        let filter = sql::distance_filter(values, "Builder/PostgreSQL.php", 832)?;
+        let filter = sql::distance_filter(values, "Builder/PostgreSQL.php", 815)?;
         let operator = distance_operator(method);
-        b.add_binding(wkt_of(&filter.geometry, Self::CLASS)?, None);
+        let wkt = wkt_of(b, &filter.geometry)?;
+        b.add_binding(wkt, None);
         b.add_binding(Value::Float(filter.distance), None);
         if filter.meters {
             return Ok(format!(
@@ -828,7 +904,7 @@ impl SqlDialect for PostgreSqlDialect {
         values: &Array,
         not: bool,
     ) -> Result<String> {
-        let wkt = sql::predicate_wkt(values, Self::CLASS, "Builder/PostgreSQL.php", 861)?;
+        let wkt = sql::predicate_wkt(b, values, Self::CLASS, "Builder/PostgreSQL.php", 844)?;
         b.add_binding(value::string(wkt), None);
         let expression = format!("{function}({attribute}, ST_GeomFromText(?, 4326))");
         Ok(if not { format!("NOT {expression}") } else { expression })
@@ -840,7 +916,16 @@ impl SqlDialect for PostgreSqlDialect {
         values: &Array,
         not: bool,
     ) -> Result<String> {
-        Self::compile_spatial_predicate(b, "ST_Covers", attribute, values, not)
+        // Through the step, so a subclass's compileSpatialPredicate() writes this one too.
+        b.step_string(
+            crate::builder::Step::CompileSpatialPredicate,
+            &[
+                crate::builder::Arg::Str("ST_Covers"),
+                crate::builder::Arg::Str(attribute),
+                crate::builder::Arg::Values(values),
+                crate::builder::Arg::Bool(not),
+            ],
+        )
     }
 
     fn compile_json_contains_expression(
@@ -955,7 +1040,7 @@ impl TableSampling for PostgreSqlDialect {
 }
 
 impl Sequences for PostgreSqlDialect {
-    fn sequence_expression(_b: &Builder<Self>, next: bool, sequence: &str) -> Result<String> {
+    fn sequence_expression(_b: &mut Builder<Self>, next: bool, sequence: &str) -> Result<String> {
         Ok(format!("{}('{sequence}')", if next { "nextval" } else { "currval" }))
     }
 }

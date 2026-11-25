@@ -1,5 +1,6 @@
 //! [`Parser`]: tokens to a [`Select`].
 
+use crate::StringLiteral;
 use std::borrow::Cow;
 
 use php_std::Str;
@@ -58,14 +59,35 @@ const STACK_SIZE: usize = 4 << 20;
 /// echo $select->where->operator, "\n"; // >
 /// ```
 #[derive(Debug, Clone, Copy, Default)]
-pub struct Parser;
+pub struct Parser {
+    literal: StringLiteral,
+    widened: bool,
+}
 
 impl Parser {
     /// A parser.
     ///
     /// PHP: `new Parser()`.
     pub const fn new() -> Self {
-        Parser
+        Parser { literal: StringLiteral::Backslash, widened: false }
+    }
+
+    /// The parser reading string literals by `literal`'s rules.
+    ///
+    /// PHP: `new Parser($literal)`.
+    #[must_use]
+    pub const fn with_literal(mut self, literal: StringLiteral) -> Self {
+        self.literal = literal;
+        self
+    }
+
+    /// The parser for tokens whose text holds a character for each byte, as the
+    /// PHP extension passes a string that is not UTF-8. What a literal's
+    /// escapes spell is then written the same way.
+    #[must_use]
+    pub const fn widened(mut self) -> Self {
+        self.widened = true;
+        self
     }
 
     /// The statement `tokens` spell: filtered tokens ending with
@@ -75,7 +97,19 @@ impl Parser {
     ///
     /// PHP: `Parser::parse()`.
     pub fn parse(&self, tokens: &[Token<'_>]) -> Result<Select> {
-        State { tokens, pos: 0, depth: 0, in_column_list: false }.select()
+        let mut state = State { tokens, pos: 0, depth: 0, in_column_list: false, parser: *self };
+        let select = state.select()?;
+        state.match_and_consume(TokenType::Semicolon);
+        let t = state.current();
+        if t.kind != TokenType::Eof {
+            return Err(Error::Validation(format!(
+                "Unexpected token '{}' ({}) at position {}",
+                text(&t.value),
+                t.kind.name(),
+                t.position
+            )));
+        }
+        Ok(select)
     }
 
     /// The statement `sql` spells, tokenized with the standard
@@ -83,7 +117,7 @@ impl Parser {
     ///
     /// PHP: `$parser->parse(Tokenizer::filter((new Tokenizer())->tokenize($sql)))`.
     pub fn parse_sql<S: AsRef<[u8]> + ?Sized>(&self, sql: &S) -> Result<Select> {
-        let tokens = Tokenizer::filter(Tokenizer::new().tokenize(sql)?);
+        let tokens = Tokenizer::filter(Tokenizer::new().with_literal(self.literal).tokenize(sql)?);
         self.parse(&tokens)
     }
 }
@@ -95,6 +129,7 @@ struct State<'t, 'a> {
     pos: usize,
     depth: usize,
     in_column_list: bool,
+    parser: Parser,
 }
 
 fn error(message: String) -> Error {
@@ -505,8 +540,7 @@ impl<'t, 'a> State<'t, 'a> {
                 if self.peek_keyword(1, keyword) {
                     self.advance();
                     self.advance();
-                    let right = self.addition()?;
-                    return Ok(Binary::new(left, operator, right).into());
+                    return self.like(left, operator);
                 }
             }
         }
@@ -522,8 +556,7 @@ impl<'t, 'a> State<'t, 'a> {
         for keyword in ["LIKE", "ILIKE"] {
             if self.match_keyword(keyword) {
                 self.advance();
-                let right = self.addition()?;
-                return Ok(Binary::new(left, keyword, right).into());
+                return self.like(left, keyword);
             }
         }
 
@@ -614,7 +647,7 @@ impl<'t, 'a> State<'t, 'a> {
         while self.current().kind == TokenType::Operator && *self.current().value == *b"::" {
             self.advance();
             let data_type = self.expect_identifier()?;
-            expression = Cast::new(expression, data_type).into();
+            expression = Cast::new(expression, data_type)?.into();
         }
         for operator in operators.into_iter().rev() {
             expression = Unary::new(operator, expression, true).into();
@@ -657,8 +690,13 @@ impl<'t, 'a> State<'t, 'a> {
             }
             TokenType::String => {
                 self.advance();
-                let unescaped = replace(&replace(inner(&t.value), b"''", b"'"), b"\\'", b"'");
-                return Ok(Literal { value: Value::Str(Str::from(unescaped)) }.into());
+                let rules = self.parser.literal;
+                let value = if self.parser.widened {
+                    crate::literal::widen(&rules.unquote(&crate::literal::narrow(&t.value))?)
+                } else {
+                    rules.unquote(&t.value)?
+                };
+                return Ok(Literal { value: Value::Str(Str::from(value)) }.into());
             }
             TokenType::Boolean => {
                 self.advance();
@@ -705,6 +743,18 @@ impl<'t, 'a> State<'t, 'a> {
         ))
     }
 
+    /// The pattern of a `LIKE`, and what `ESCAPE` names after it.
+    fn like(&mut self, left: Expression, operator: &str) -> Result<Expression> {
+        let like = Binary::new(left, operator, self.addition()?);
+        let t = self.current();
+        let escape = matches!(t.kind, TokenType::Identifier | TokenType::Keyword) && eq_upper(&t.value, "ESCAPE");
+        if !escape {
+            return Ok(like.into());
+        }
+        self.advance();
+        Ok(like.with_escape(self.addition()?).into())
+    }
+
     fn identifier_expression(&mut self) -> Result<Expression> {
         let name = self.extract_identifier(self.current())?;
         self.advance();
@@ -742,11 +792,11 @@ impl<'t, 'a> State<'t, 'a> {
         if self.is(TokenType::Star) {
             self.advance();
             self.expect(TokenType::RightParen)?;
-            return self.function_postfix(Func::new(name, vec![Star::default().into()]));
+            return self.function_postfix(Func::new(name, vec![Star::default().into()], false, None)?);
         }
         if self.is(TokenType::RightParen) {
             self.advance();
-            return self.function_postfix(Func::new(name, Vec::new()));
+            return self.function_postfix(Func::new(name, Vec::new(), false, None)?);
         }
 
         let mut distinct = false;
@@ -761,7 +811,7 @@ impl<'t, 'a> State<'t, 'a> {
         }
         self.expect(TokenType::RightParen)?;
 
-        self.function_postfix(Func { name, arguments, distinct, filter: None })
+        self.function_postfix(Func::new(name, arguments, distinct, None)?)
     }
 
     fn function_postfix(&mut self, mut function: Func) -> Result<Expression> {
@@ -834,7 +884,7 @@ impl<'t, 'a> State<'t, 'a> {
         self.consume_keyword("AS")?;
         let data_type = self.expect_identifier()?;
         self.expect(TokenType::RightParen)?;
-        Ok(Cast::new(expression, data_type).into())
+        Ok(Cast::new(expression, data_type)?.into())
     }
 
     fn table_source(&mut self) -> Result<TableSource> {

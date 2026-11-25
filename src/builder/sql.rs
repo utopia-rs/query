@@ -4,6 +4,7 @@
 //!
 //! PHP: `Utopia\Query\Builder\SQL` and the `Spatial` trait.
 
+use crate::builder::steps::{Arg, Ret, Step};
 use php_std::ArrayKey;
 
 use crate::builder::core::{Builder, Dialect};
@@ -75,18 +76,74 @@ pub trait SqlDialect: Dialect {
     }
 }
 
+/// The steps the SQL dialects have, run as `D` itself does.
+pub(crate) fn sql_base_step<D: SqlDialect>(
+    b: &mut Builder<D>,
+    step: Step,
+    arguments: &[Arg<'_>],
+) -> Option<Result<Ret>> {
+    Some(match (step, arguments) {
+        (Step::CompileSearchExpression, [Arg::Str(attribute), Arg::Values(values), Arg::Bool(not)]) => {
+            D::compile_search_expression(b, attribute, values, *not).map(Ret::Str)
+        }
+        (Step::CompileSpatialFilter, [Arg::Method(method), Arg::Str(attribute), Arg::Query(query)]) => {
+            D::compile_spatial_filter(b, *method, attribute, query).map(Ret::Str)
+        }
+        (Step::CompileArrayFilter, [Arg::Method(method), Arg::Str(attribute), Arg::Query(query)]) => {
+            D::compile_array_filter(b, *method, attribute, query).map(Ret::Str)
+        }
+        (Step::CompileJsonContainsExpression, [Arg::Str(attribute), Arg::Values(values), Arg::Bool(not)]) => {
+            D::compile_json_contains_expression(b, attribute, values, *not).map(Ret::Str)
+        }
+        (Step::CompileJsonOverlapsExpression, [Arg::Str(attribute), Arg::Values(values)]) => {
+            D::compile_json_overlaps_expression(b, attribute, values).map(Ret::Str)
+        }
+        (Step::CompileSpatialDistance, [Arg::Method(method), Arg::Str(attribute), Arg::Values(values)]) => {
+            D::compile_spatial_distance(b, *method, attribute, values).map(Ret::Str)
+        }
+        (
+            Step::CompileSpatialPredicate,
+            [Arg::Str(function), Arg::Str(attribute), Arg::Values(values), Arg::Bool(not)],
+        ) => D::compile_spatial_predicate(b, function, attribute, values, *not).map(Ret::Str),
+        (Step::CompileSpatialCoversPredicate, [Arg::Str(attribute), Arg::Values(values), Arg::Bool(not)]) => {
+            D::compile_spatial_covers_predicate(b, attribute, values, *not).map(Ret::Str)
+        }
+        (Step::CompileJsonPathExpression, [Arg::Str(attribute), Arg::Values(values)]) => {
+            D::compile_json_path_expression(b, attribute, values).map(Ret::Str)
+        }
+        (Step::CompileJsonFilter, [Arg::Method(method), Arg::Str(attribute), Arg::Query(query)]) => {
+            sql_compile_json_filter(b, *method, attribute, query).map(Ret::Str)
+        }
+        (Step::CompileConflictHeader, []) => D::compile_conflict_header(b).map(Ret::Str),
+        (Step::CompileConflictAssignment, [Arg::Str(wrapped)]) => Ok(Ret::Str(D::compile_conflict_assignment(wrapped))),
+        (Step::CompileConflictClause, []) => crate::builder::mysql::base_conflict_clause(b).map(Ret::Str),
+        _ => return None,
+    })
+}
+
 /// PHP's `SQL::compileFilter()`: search, spatial, JSON and array filters,
 /// then the base filters.
 pub(crate) fn sql_compile_filter<D: SqlDialect>(b: &mut Builder<D>, query: &Query) -> Result<String> {
     let method = query.method();
     let attribute = b.resolve_and_wrap(query.attribute())?;
     match method {
-        Method::Search => return D::compile_search_expression(b, &attribute, query.values(), false),
-        Method::NotSearch => return D::compile_search_expression(b, &attribute, query.values(), true),
+        Method::Search => {
+            return b.step_string(
+                Step::CompileSearchExpression,
+                &[Arg::Str(&attribute), Arg::Values(query.values()), Arg::Bool(false)],
+            );
+        }
+        Method::NotSearch => {
+            return b.step_string(
+                Step::CompileSearchExpression,
+                &[Arg::Str(&attribute), Arg::Values(query.values()), Arg::Bool(true)],
+            );
+        }
         _ => {}
     }
     if method.is_spatial() {
-        return D::compile_spatial_filter(b, method, &attribute, query);
+        return b
+            .step_string(Step::CompileSpatialFilter, &[Arg::Method(method), Arg::Str(&attribute), Arg::Query(query)]);
     }
     if matches!(query.attribute_type(), "point" | "linestring" | "polygon") {
         let spatial = match method {
@@ -97,16 +154,20 @@ pub(crate) fn sql_compile_filter<D: SqlDialect>(b: &mut Builder<D>, query: &Quer
             _ => None,
         };
         if let Some(spatial) = spatial {
-            return D::compile_spatial_filter(b, spatial, &attribute, query);
+            return b.step_string(
+                Step::CompileSpatialFilter,
+                &[Arg::Method(spatial), Arg::Str(&attribute), Arg::Query(query)],
+            );
         }
     }
     if method.is_json() {
-        return sql_compile_json_filter(b, method, &attribute, query);
+        return b.step_string(Step::CompileJsonFilter, &[Arg::Method(method), Arg::Str(&attribute), Arg::Query(query)]);
     }
     if query.on_array()
         && matches!(method, Method::Contains | Method::ContainsAny | Method::NotContains | Method::ContainsAll)
     {
-        return D::compile_array_filter(b, method, &attribute, query);
+        return b
+            .step_string(Step::CompileArrayFilter, &[Arg::Method(method), Arg::Str(&attribute), Arg::Query(query)]);
     }
     b.base_compile_filter(query)
 }
@@ -120,9 +181,17 @@ pub(crate) fn sql_compile_array_filter<D: SqlDialect>(
 ) -> Result<String> {
     let wrapped = crate::value::list([Value::Array(query.values().clone())]);
     match method {
-        Method::Contains | Method::ContainsAny => D::compile_json_overlaps_expression(b, attribute, &wrapped),
-        Method::NotContains => Ok(format!("NOT {}", D::compile_json_overlaps_expression(b, attribute, &wrapped)?)),
-        Method::ContainsAll => D::compile_json_contains_expression(b, attribute, &wrapped, false),
+        Method::Contains | Method::ContainsAny => {
+            b.step_string(Step::CompileJsonOverlapsExpression, &[Arg::Str(attribute), Arg::Values(&wrapped)])
+        }
+        Method::NotContains => Ok(format!(
+            "NOT {}",
+            b.step_string(Step::CompileJsonOverlapsExpression, &[Arg::Str(attribute), Arg::Values(&wrapped)])?
+        )),
+        Method::ContainsAll => b.step_string(
+            Step::CompileJsonContainsExpression,
+            &[Arg::Str(attribute), Arg::Values(&wrapped), Arg::Bool(false)],
+        ),
         _ => b.base_compile_filter(query),
     }
 }
@@ -135,23 +204,36 @@ pub(crate) fn sql_compile_spatial_filter<D: SqlDialect>(
     query: &Query,
 ) -> Result<String> {
     let values = query.values();
+    let predicate = |b: &mut Builder<D>, function: &str, not: bool| {
+        b.step_string(
+            Step::CompileSpatialPredicate,
+            &[Arg::Str(function), Arg::Str(attribute), Arg::Values(values), Arg::Bool(not)],
+        )
+    };
     use Method::*;
     match method {
-        DistanceLessThan | DistanceGreaterThan | DistanceEqual | DistanceNotEqual => {
-            D::compile_spatial_distance(b, method, attribute, values)
-        }
-        Intersects => D::compile_spatial_predicate(b, "ST_Intersects", attribute, values, false),
-        NotIntersects => D::compile_spatial_predicate(b, "ST_Intersects", attribute, values, true),
-        Crosses => D::compile_spatial_predicate(b, "ST_Crosses", attribute, values, false),
-        NotCrosses => D::compile_spatial_predicate(b, "ST_Crosses", attribute, values, true),
-        Overlaps => D::compile_spatial_predicate(b, "ST_Overlaps", attribute, values, false),
-        NotOverlaps => D::compile_spatial_predicate(b, "ST_Overlaps", attribute, values, true),
-        Touches => D::compile_spatial_predicate(b, "ST_Touches", attribute, values, false),
-        NotTouches => D::compile_spatial_predicate(b, "ST_Touches", attribute, values, true),
-        Covers => D::compile_spatial_covers_predicate(b, attribute, values, false),
-        NotCovers => D::compile_spatial_covers_predicate(b, attribute, values, true),
-        SpatialEquals => D::compile_spatial_predicate(b, "ST_Equals", attribute, values, false),
-        NotSpatialEquals => D::compile_spatial_predicate(b, "ST_Equals", attribute, values, true),
+        DistanceLessThan | DistanceGreaterThan | DistanceEqual | DistanceNotEqual => b.step_string(
+            Step::CompileSpatialDistance,
+            &[Arg::Method(method), Arg::Str(attribute), Arg::Values(values)],
+        ),
+        Intersects => predicate(b, "ST_Intersects", false),
+        NotIntersects => predicate(b, "ST_Intersects", true),
+        Crosses => predicate(b, "ST_Crosses", false),
+        NotCrosses => predicate(b, "ST_Crosses", true),
+        Overlaps => predicate(b, "ST_Overlaps", false),
+        NotOverlaps => predicate(b, "ST_Overlaps", true),
+        Touches => predicate(b, "ST_Touches", false),
+        NotTouches => predicate(b, "ST_Touches", true),
+        Covers => b.step_string(
+            Step::CompileSpatialCoversPredicate,
+            &[Arg::Str(attribute), Arg::Values(values), Arg::Bool(false)],
+        ),
+        NotCovers => b.step_string(
+            Step::CompileSpatialCoversPredicate,
+            &[Arg::Str(attribute), Arg::Values(values), Arg::Bool(true)],
+        ),
+        SpatialEquals => predicate(b, "ST_Equals", false),
+        NotSpatialEquals => predicate(b, "ST_Equals", true),
         _ => b.base_compile_filter(query),
     }
 }
@@ -165,10 +247,18 @@ pub(crate) fn sql_compile_json_filter<D: SqlDialect>(
 ) -> Result<String> {
     let values = query.values();
     match method {
-        Method::JsonContains => D::compile_json_contains_expression(b, attribute, values, false),
-        Method::JsonNotContains => D::compile_json_contains_expression(b, attribute, values, true),
-        Method::JsonOverlaps => D::compile_json_overlaps_expression(b, attribute, values),
-        Method::JsonPath => D::compile_json_path_expression(b, attribute, values),
+        Method::JsonContains => b.step_string(
+            Step::CompileJsonContainsExpression,
+            &[Arg::Str(attribute), Arg::Values(values), Arg::Bool(false)],
+        ),
+        Method::JsonNotContains => b.step_string(
+            Step::CompileJsonContainsExpression,
+            &[Arg::Str(attribute), Arg::Values(values), Arg::Bool(true)],
+        ),
+        Method::JsonOverlaps => {
+            b.step_string(Step::CompileJsonOverlapsExpression, &[Arg::Str(attribute), Arg::Values(values)])
+        }
+        Method::JsonPath => b.step_string(Step::CompileJsonPathExpression, &[Arg::Str(attribute), Arg::Values(values)]),
         _ => b.base_compile_filter(query),
     }
 }
@@ -182,60 +272,93 @@ fn at(array: &Array, index: i64) -> Option<&Value> {
     array.get(&ArrayKey::Int(index))
 }
 
-/// The PHP class whose `Spatial` trait [`geometry_to_wkt`] names in its errors.
-const MYSQL: &str = "Utopia\\Query\\Builder\\MySQL";
-
 /// A coordinate array as WKT: `[x, y]` a point, a list of points a line, a
-/// list of rings a polygon. Fails with PHP's `TypeError` when a point or a
-/// ring is not an array.
+/// list of closed rings of at least 4 points a polygon. Fails with
+/// [`Error::Validation`](crate::Error::Validation) on any other shape, or a
+/// point that is not an `[x, y]` pair of finite numbers.
 ///
 /// PHP: `Spatial::geometryToWkt()`.
 pub fn geometry_to_wkt(geometry: &Array) -> Result<String> {
-    wkt(geometry, MYSQL)
+    if is_coordinate(geometry) {
+        return Ok(format!("POINT({})", coordinate_wkt(geometry)));
+    }
+    let Some(Value::Array(first)) = at(geometry, 0).filter(|_| geometry.is_list()) else {
+        return Err(invalid("expected an [x, y] point, a list of points or a list of rings"));
+    };
+    if let Some(Value::Array(_)) = at(first, 0) {
+        let rings = geometry.values().map(|ring| Ok(format!("({})", ring_wkt(ring)?))).collect::<Result<Vec<_>>>()?;
+        return Ok(format!("POLYGON({})", rings.join(", ")));
+    }
+    if geometry.len() == 1 {
+        return Ok(format!("POINT({})", point_wkt(at(geometry, 0))?));
+    }
+    Ok(format!("LINESTRING({})", points_wkt(geometry)?))
 }
 
-/// [`geometry_to_wkt`] as `class` (the class using PHP's `Spatial` trait)
-/// runs it: its closures are named after the class.
-pub(crate) fn wkt(geometry: &Array, class: &str) -> Result<String> {
-    let first = at(geometry, 0);
-    if geometry.len() == 2 && first.is_some_and(is_numeric) && at(geometry, 1).is_some_and(is_numeric) {
-        return Ok(format!("POINT({} {})", coordinate(first), coordinate(at(geometry, 1))));
+fn invalid(reason: &str) -> crate::Error {
+    crate::Error::Validation(format!("Invalid geometry: {reason}"))
+}
+
+/// PHP's `Spatial::ringToWkt()`: a closed ring of at least 4 points.
+fn ring_wkt(ring: &Value) -> Result<String> {
+    let ring = match ring {
+        Value::Array(ring) if !ring.is_empty() && ring.is_list() => ring,
+        _ => return Err(invalid("a polygon ring must be a list of points")),
+    };
+    let wkt = points_wkt(ring)?;
+    if ring.len() < 4 {
+        return Err(invalid("a polygon ring must have at least 4 points"));
     }
-    if let Some(Value::Array(first_item)) = first {
-        let point = |line: u32, p: &Value| -> Result<String> {
-            let closure =
-                format!("{class}::{{closure:Utopia\\Query\\Builder\\Trait\\Spatial::geometryToWkt():{line}}}");
-            let p = Param::closure(&closure, 1, "p").array(p)?;
-            Ok(format!("{} {}", coordinate(at(p, 0)), coordinate(at(p, 1))))
-        };
-        if let Some(Value::Array(_)) = at(first_item, 0) {
-            const ARRAY_MAP: Param<'static> = Param::internal("array_map", 2, "array");
-            let mut rings = Vec::with_capacity(geometry.len());
-            for ring in geometry.values() {
-                let points = ARRAY_MAP.array(ring)?.values().map(|p| point(30, p)).collect::<Result<Vec<_>>>()?;
-                rings.push(format!("({})", points.join(", ")));
-            }
-            return Ok(format!("POLYGON({})", rings.join(", ")));
-        }
-        if geometry.len() == 1 {
-            return Ok(format!("POINT({} {})", coordinate(at(first_item, 0)), coordinate(at(first_item, 1))));
-        }
-        let points = geometry.values().map(|p| point(47, p)).collect::<Result<Vec<_>>>()?;
-        return Ok(format!("LINESTRING({})", points.join(", ")));
+    let xy = |p: Option<&Value>| match p {
+        Some(Value::Array(p)) => (number(at(p, 0)), number(at(p, 1))),
+        _ => (0.0, 0.0),
+    };
+    if xy(at(ring, 0)) != xy(at(ring, ring.len() as i64 - 1)) {
+        return Err(invalid("a polygon ring must be closed, with its first point equal to its last"));
     }
-    Ok(format!(
-        "POINT({} {})",
-        coordinate(first.or(Some(&Value::Int(0)))),
-        coordinate(at(geometry, 1).or(Some(&Value::Int(0))))
-    ))
+    Ok(wkt)
+}
+
+/// PHP's `Spatial::coordinatesToWkt()`.
+fn points_wkt(points: &Array) -> Result<String> {
+    Ok(points.values().map(|p| point_wkt(Some(p))).collect::<Result<Vec<_>>>()?.join(", "))
+}
+
+/// PHP's `Spatial::coordinateToWkt()`: `x y`, or an error unless `point` is
+/// an `[x, y]` pair of finite numbers.
+pub(crate) fn point_wkt(point: Option<&Value>) -> Result<String> {
+    match point {
+        Some(Value::Array(p)) if is_coordinate(p) => Ok(coordinate_wkt(p)),
+        _ => Err(invalid("every point must be an [x, y] pair of finite numbers")),
+    }
+}
+
+fn coordinate_wkt(point: &Array) -> String {
+    format!("{} {}", coordinate(at(point, 0)), coordinate(at(point, 1)))
+}
+
+/// PHP's `Spatial::isCoordinate()`: a list of two finite numbers.
+fn is_coordinate(value: &Array) -> bool {
+    let finite = |v: Option<&Value>| v.is_some_and(|v| is_numeric(v) && v.to_double().is_finite());
+    value.len() == 2 && value.is_list() && finite(at(value, 0)) && finite(at(value, 1))
+}
+
+fn number(value: Option<&Value>) -> f64 {
+    value.map(Value::to_double).unwrap_or(0.0)
 }
 
 /// `$this->geometryToWkt($values[0])` in `class`, called from `file` at
 /// `line`: the WKT of a spatial predicate's geometry.
-pub(crate) fn predicate_wkt(values: &Array, class: &str, file: &'static str, line: u32) -> Result<String> {
+pub(crate) fn predicate_wkt<D: Dialect>(
+    b: &mut Builder<D>,
+    values: &Array,
+    class: &str,
+    file: &'static str,
+    line: u32,
+) -> Result<String> {
     let geometry = values.get(&ArrayKey::Int(0)).unwrap_or(&Value::Null);
     let function = format!("{class}::geometryToWkt");
-    wkt(Param::method(&function, 1, "geometry", file, line).array(geometry)?, class)
+    b.geometry_to_wkt(Param::method(&function, 1, "geometry", file, line).array(geometry)?)
 }
 
 /// `SpatialDistanceFilter::fromTuple($values[0])`, called from `file` at `line`.
@@ -245,10 +368,10 @@ pub(crate) fn distance_filter(values: &Array, file: &'static str, line: u32) -> 
     SpatialDistanceFilter::from_tuple(param.array(tuple)?)
 }
 
-/// The WKT of a distance filter's geometry in `class` (a WKT string stays as is).
-pub(crate) fn wkt_of(geometry: &Value, class: &str) -> Result<Value> {
+/// The WKT of a distance filter's geometry (a WKT string stays as is).
+pub(crate) fn wkt_of<D: Dialect>(b: &mut Builder<D>, geometry: &Value) -> Result<Value> {
     Ok(match geometry {
-        Value::Array(a) => crate::value::string(wkt(a, class)?),
+        Value::Array(a) => crate::value::string(b.geometry_to_wkt(a)?),
         other => other.clone(),
     })
 }

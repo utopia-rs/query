@@ -26,7 +26,7 @@ use std::ops::Deref;
 use php_std::ArrayKey;
 use php_std::json::Flags;
 
-use crate::builder::core::{Builder, Dialect, escape_like_value, first, key_string};
+use crate::builder::core::{Builder, Dialect, first, key_string};
 use crate::builder::feature::{
     BitwiseAggregates, ConditionalAggregates, CrossJoins, Cube, FullOuterJoins, Hints, RawSql, Rollup,
     StringAggregates, TableSampling, Totals, is_plain_identifier,
@@ -307,28 +307,22 @@ impl FormattedInsertStatement {
     }
 }
 
-/// `$` without `/D` also matches before a final newline: the text the
-/// pattern's body must cover.
-fn before_final_newline(text: &str) -> &str {
-    text.strip_suffix('\n').unwrap_or(text)
-}
-
 /// `/^[A-Za-z0-9_=., ]+$/`.
 fn is_hint(hint: &str) -> bool {
-    let bytes = before_final_newline(hint).as_bytes();
+    let bytes = hint.as_bytes();
     !bytes.is_empty()
         && bytes.iter().all(|&b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'=' | b'.' | b',' | b' '))
 }
 
 /// `/^[a-zA-Z0-9_.]+$/`.
 fn is_setting_value(text: &str) -> bool {
-    let bytes = before_final_newline(text).as_bytes();
+    let bytes = text.as_bytes();
     !bytes.is_empty() && bytes.iter().all(|&b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.'))
 }
 
 /// `/^[A-Za-z][A-Za-z0-9_]*$/`.
 fn is_format_name(text: &str) -> bool {
-    let bytes = before_final_newline(text).as_bytes();
+    let bytes = text.as_bytes();
     bytes.first().is_some_and(u8::is_ascii_alphabetic) && bytes.iter().all(|&b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
@@ -368,8 +362,7 @@ fn is_clickhouse_type(text: &str) -> bool {
         }
         false
     }
-    let bytes = text.as_bytes();
-    full(bytes) || bytes.strip_suffix(b"\n").is_some_and(full)
+    full(text.as_bytes())
 }
 
 /// The ClickHouse type of a binding without a registered type.
@@ -385,6 +378,27 @@ fn infer_type(value: Option<&Value>) -> &'static str {
 
 /// Rewrites the `?` placeholders (not `??`, `?|`, `?&`) to `{paramN:Type}`
 /// and attaches the named bindings, when named bindings are on.
+/// `$this->applyNamedTypedBindings()`: a subclass's own when it has one.
+fn named(b: &mut ClickHouse, statement: Statement) -> Result<Statement> {
+    use crate::builder::{Arg, Ret, Step};
+    if !b.overrides(Step::ApplyNamedTypedBindings) {
+        return Ok(apply_named_typed_bindings(b, statement));
+    }
+    match b.step(Step::ApplyNamedTypedBindings, &[Arg::Statement(&statement)])? {
+        Ret::Statement(statement) => Ok(statement),
+        _ => Ok(statement),
+    }
+}
+
+impl ClickHouse {
+    /// `statement` with its `?` placeholders named and typed, when named bindings are on.
+    ///
+    /// PHP: `applyNamedTypedBindings()`.
+    pub fn apply_named_typed_bindings(&self, statement: Statement) -> Statement {
+        apply_named_typed_bindings(self, statement)
+    }
+}
+
 fn apply_named_typed_bindings(b: &ClickHouse, statement: Statement) -> Statement {
     if !b.dialect.named_bindings || statement.bindings.is_empty() {
         return statement;
@@ -433,6 +447,20 @@ fn select_function(b: &mut ClickHouse, expression: String, alias: &str) -> Resul
 impl Dialect for ClickHouseDialect {
     const CLASS: &'static str = "Utopia\\Query\\Builder\\ClickHouse";
 
+    fn base_step(
+        _b: &mut Builder<Self>,
+        step: crate::builder::Step,
+        arguments: &[crate::builder::Arg<'_>],
+    ) -> Option<Result<crate::builder::Ret>> {
+        if let (crate::builder::Step::ApplyNamedTypedBindings, [crate::builder::Arg::Statement(statement)]) =
+            (step, arguments)
+        {
+            return Some(Ok(crate::builder::Ret::Statement(apply_named_typed_bindings(_b, (*statement).clone()))));
+        }
+        crate::builder::feature::aggregates_base_step::<Self>(step, arguments)
+    }
+    const LITERAL: crate::StringLiteral = crate::StringLiteral::BackslashUtf8;
+
     fn compile_random(_b: &Builder<Self>) -> String {
         "rand()".into()
     }
@@ -462,9 +490,9 @@ impl Dialect for ClickHouseDialect {
             let not = if not { "NOT " } else { "" };
             return Ok(format!("{not}{function}({attribute}, ?)"));
         }
-        let escaped = escape_like_value(&raw);
-        b.add_binding(value::string(format!("{prefix}{escaped}{suffix}")), column);
-        Ok(format!("{attribute} {} ?", if not { "NOT LIKE" } else { "LIKE" }))
+        let pattern = b.like_value(prefix, &raw, suffix)?;
+        b.add_binding(pattern, column);
+        b.like_predicate(attribute, not)
     }
 
     fn compile_contains(
@@ -524,7 +552,7 @@ impl Dialect for ClickHouseDialect {
             b.add_bindings(result.bindings);
             return Ok(format!("FROM ({}) AS {}", result.query, b.quote(&sub.alias)?));
         }
-        let mut sql = format!("FROM {}", b.quote(&b.core.table)?);
+        let mut sql = format!("FROM {}", b.quote(&b.core.table.clone())?);
         if b.dialect.final_ {
             sql.push_str(" FINAL");
         }
@@ -537,7 +565,7 @@ impl Dialect for ClickHouseDialect {
         }
         if !b.core.alias.is_empty() {
             sql.push_str(" AS ");
-            sql.push_str(&b.quote(&b.core.alias)?);
+            sql.push_str(&b.quote(&b.core.alias.clone())?);
         }
         Ok(sql)
     }
@@ -614,7 +642,7 @@ impl Dialect for ClickHouseDialect {
 
     fn build(b: &mut Builder<Self>) -> Result<Statement> {
         let result = b.base_build()?;
-        Ok(apply_named_typed_bindings(b, result))
+        named(b, result)
     }
 
     fn insert(b: &mut Builder<Self>) -> Result<Statement> {
@@ -622,7 +650,7 @@ impl Dialect for ClickHouseDialect {
             Some(formatted) => Ok(formatted.statement),
             None => {
                 let result = b.base_insert()?;
-                Ok(apply_named_typed_bindings(b, result))
+                named(b, result)
             }
         }
     }
@@ -639,10 +667,14 @@ impl Dialect for ClickHouseDialect {
         if parts.is_empty() {
             return Err(Error::Validation("ClickHouse UPDATE requires a WHERE clause.".into()));
         }
-        let sql =
-            format!("ALTER TABLE {} UPDATE {} {}", b.quote(&b.core.table)?, assignments.join(", "), parts.join(" "));
+        let sql = format!(
+            "ALTER TABLE {} UPDATE {} {}",
+            b.quote(&b.core.table.clone())?,
+            assignments.join(", "),
+            parts.join(" ")
+        );
         let statement = b.statement(sql);
-        Ok(apply_named_typed_bindings(b, statement))
+        named(b, statement)
     }
 
     fn delete(b: &mut Builder<Self>) -> Result<Statement> {
@@ -653,24 +685,24 @@ impl Dialect for ClickHouseDialect {
         if parts.is_empty() {
             return Err(Error::Validation("ClickHouse DELETE requires a WHERE clause.".into()));
         }
-        let table = b.quote(&b.core.table)?;
+        let table = b.quote(&b.core.table.clone())?;
         let mut sql = match b.dialect.delete_mode {
             DeleteMode::Lightweight => format!("DELETE FROM {table} {}", parts.join(" ")),
             DeleteMode::Mutation => format!("ALTER TABLE {table} DELETE {}", parts.join(" ")),
         };
-        let settings = Self::build_settings_clause(b)?;
+        let settings = b.step_string(crate::builder::Step::BuildSettingsClause, &[])?;
         if !settings.is_empty() {
             sql.push(' ');
             sql.push_str(&settings);
         }
         let statement = b.statement(sql);
-        Ok(apply_named_typed_bindings(b, statement))
+        named(b, statement)
     }
 
     fn reset(b: &mut Builder<Self>) {
         b.dialect = ClickHouseDialect::default();
         b.core.hints.clear();
-        b.core.group_by_modifier = None;
+        b.reset_group_by_modifier();
     }
 
     fn ast_dialect() -> crate::builder::AstDialect {
@@ -907,7 +939,7 @@ impl Builder<ClickHouseDialect> {
         if columns.iter().any(String::is_empty) {
             return Err(Error::Validation("Column names for FORMAT INSERT must be non-empty strings.".into()));
         }
-        let mut sql = format!("INSERT INTO {}", self.quote(&self.core.table)?);
+        let mut sql = format!("INSERT INTO {}", self.quote(&self.core.table.clone())?);
         if !columns.is_empty() {
             let wrapped = columns.iter().map(|c| self.resolve_and_wrap(c)).collect::<Result<Vec<_>>>()?;
             sql.push_str(" (");
@@ -1307,7 +1339,7 @@ mod tests {
         assert!(is_clickhouse_type("Int64"));
         assert!(is_clickhouse_type("Nullable(DateTime64(3))"));
         assert!(is_clickhouse_type("Decimal(10, 2)"));
-        assert!(is_clickhouse_type("Int64\n"));
+        assert!(!is_clickhouse_type("Int64\n"));
         assert!(!is_clickhouse_type("DROP TABLE x; --"));
         assert!(!is_clickhouse_type("A(B(C(1)))"));
         assert!(!is_clickhouse_type("A(1))"));

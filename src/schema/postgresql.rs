@@ -104,7 +104,7 @@ impl PostgreSql {
             if !names::is_identifier(key) {
                 return Err(Error::Validation(format!("Invalid collation option key: {key}")));
             }
-            parts.push(format!("{key} = {}", names::literal(value)));
+            parts.push(format!("{key} = {}", self.literal().quote(value)?));
         }
         parts.push(format!("deterministic = {deterministic}"));
         base::plain(self, format!("CREATE COLLATION IF NOT EXISTS {} ({})", self.quote(name)?, parts.join(", ")))
@@ -162,6 +162,10 @@ impl Schema for PostgreSql {
     fn set_executor(&mut self, executor: Executor) -> &mut Self {
         self.executor = Some(executor);
         self
+    }
+
+    fn literal(&self) -> crate::StringLiteral {
+        crate::StringLiteral::Extended
     }
 
     fn quote(&self, identifier: &str) -> Result<String> {
@@ -235,42 +239,29 @@ impl Schema for PostgreSql {
     /// as a `CHECK (... IN (...))`, no inline comment.
     fn compile_column_definition(&self, column: &Column<Self>) -> Result<String> {
         let c = &column.def;
-        let mut parts = vec![self.quote_literal(&c.name)?, self.compile_column_type(column)?];
+        let mut out = base::column_start(self, column)?;
         if let Some(collation) = &c.collation {
-            parts.push(format!("COLLATE {}", self.quote_collation(collation)?));
+            base::add(&mut out, &["COLLATE ", &self.quote_collation(collation)?]);
         }
-        if c.unsigned {
-            let unsigned = self.compile_unsigned();
-            if !unsigned.is_empty() {
-                parts.push(unsigned.into());
-            }
-        }
-        if c.generated_expression.is_some() {
-            parts.push(self.compile_generated_clause(column));
-            parts.push(if c.nullable { "NULL" } else { "NOT NULL" }.into());
-            if let Some(check) = &c.check {
-                parts.push(format!("CHECK ({check})"));
-            }
-            return Ok(parts.join(" "));
-        }
+        let generated = c.generated_expression.is_some();
         let serial = matches!(c.kind, ColumnType::Serial | ColumnType::BigSerial | ColumnType::SmallSerial);
-        if c.auto_increment && !serial {
-            parts.push(self.compile_auto_increment().into());
+        if generated {
+            base::add(&mut out, &[&self.compile_generated_clause(column)]);
+        } else if c.auto_increment && !serial {
+            base::add(&mut out, &[self.compile_auto_increment()]);
         }
-        parts.push(if c.nullable { "NULL" } else { "NOT NULL" }.into());
-        if let Some(raw) = &c.default_raw {
-            parts.push(format!("DEFAULT {raw}"));
-        } else if let Some(value) = &c.default {
-            parts.push(format!("DEFAULT {}", base::default_value(value)));
-        }
-        if c.kind == ColumnType::Enum && !c.enum_values.is_empty() {
-            let values: Vec<String> = c.enum_values.iter().map(|v| names::literal(v)).collect();
-            parts.push(format!("CHECK ({} IN ({}))", self.quote_literal(&c.name)?, values.join(", ")));
+        base::add(&mut out, &[if c.nullable { "NULL" } else { "NOT NULL" }]);
+        if !generated {
+            base::add_default(self, &mut out, column)?;
+            if c.kind == ColumnType::Enum && !c.enum_values.is_empty() {
+                let values = c.enum_values.iter().map(|v| self.literal().quote(v)).collect::<Result<Vec<_>>>()?;
+                base::add(&mut out, &["CHECK (", &self.quote_literal(&c.name)?, " IN (", &values.join(", "), "))"]);
+            }
         }
         if let Some(check) = &c.check {
-            parts.push(format!("CHECK ({check})"));
+            base::add(&mut out, &["CHECK (", check, ")"]);
         }
-        Ok(parts.join(" "))
+        Ok(out)
     }
 
     /// Always `STORED`: PostgreSQL has no virtual generated columns.
@@ -460,7 +451,7 @@ impl feature::Triggers for PostgreSql {
 
 impl feature::Types for PostgreSql {
     fn create_type(&self, name: &str, values: &[&str]) -> Result<Statement> {
-        let values: Vec<String> = values.iter().map(|v| names::literal(v)).collect();
+        let values = values.iter().map(|v| self.literal().quote(v)).collect::<Result<Vec<_>>>()?;
         base::plain(self, format!("CREATE TYPE {} AS ENUM ({})", self.quote(name)?, values.join(", ")))
     }
 
@@ -479,13 +470,13 @@ impl feature::Sequences for PostgreSql {
     }
 
     fn next_val(&self, name: &str) -> Result<Statement> {
-        base::plain(self, format!("SELECT nextval({})", names::literal(name)))
+        base::plain(self, format!("SELECT nextval({})", self.literal().quote(name)?))
     }
 }
 
 impl feature::TableComments for PostgreSql {
     fn comment_on_table(&self, table: &str, comment: &str) -> Result<Statement> {
-        base::plain(self, format!("COMMENT ON TABLE {} IS {}", self.quote(table)?, names::literal(comment)))
+        base::plain(self, format!("COMMENT ON TABLE {} IS {}", self.quote(table)?, self.literal().quote(comment)?))
     }
 }
 
@@ -497,7 +488,7 @@ impl feature::ColumnComments for PostgreSql {
                 "COMMENT ON COLUMN {}.{} IS {}",
                 self.quote(table)?,
                 self.quote_literal(column)?,
-                names::literal(comment)
+                self.literal().quote(comment)?
             ),
         )
     }

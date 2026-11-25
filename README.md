@@ -1,8 +1,5 @@
 # Utopia Query
 
-> [!IMPORTANT]
-> This repository is a read-only mirror of [`crates/utopia/query`](https://github.com/appwrite/appwrite/tree/main/crates/utopia/query) in [appwrite/appwrite](https://github.com/appwrite/appwrite). Development happens there — please open issues and pull requests against appwrite/appwrite.
-
 [![Discord](https://img.shields.io/discord/564160730845151244?label=discord)](https://discord.gg/GSeTUeA)
 
 Queries as data, compiled to SQL (MySQL, MariaDB, PostgreSQL, SQLite, ClickHouse) and MongoDB commands; schema builders; a SQL tokenizer, parser, serializer and statement classifier.
@@ -13,7 +10,7 @@ This library is maintained by the [Appwrite team](https://appwrite.io).
 
 ```toml
 [dependencies]
-utopia-query = { git = "https://github.com/utopia-rs/query" }
+utopia-query = { git = "https://github.com/appwrite/appwrite" }
 ```
 
 Queries are data: a filter, an order, a page or a join is a `Query` you can build in code, receive as JSON from a client, validate, and compile for the database you run. This library turns lists of queries into SQL for MySQL, MariaDB, PostgreSQL, SQLite and ClickHouse, and into MongoDB commands, always with the values as bindings. It also writes DDL, and reads SQL back with a tokenizer, a parser and a classifier.
@@ -91,6 +88,42 @@ use utopia_query::classifier::{MySql, Sql};
 assert_eq!(MySql.classify_sql(b"SELECT * FROM users"), Type::Read);
 assert_eq!(MySql.classify_sql(b"UPDATE users SET name = 'a'"), Type::Write);
 ```
+
+## Contributing
+
+Development happens in [appwrite/appwrite](https://github.com/appwrite/appwrite), where this crate lives at [`crates/utopia/query`](https://github.com/appwrite/appwrite/tree/main/crates/utopia/query). Run these commands from a checkout of it. The [contributing guide](https://utopia-docs.appwrite.network/contributing) covers each step.
+
+### Test
+
+```bash
+cargo test -p utopia-query
+cargo clippy -p utopia-query --all-targets -- -D warnings
+cargo fmt --all --check
+```
+
+### Compare with PHP
+
+Replay the results PHP recorded for every case against Rust, without PHP:
+
+```bash
+COMPAT_LIB=query cargo test -p compat
+```
+
+Run every case on both runtimes, fuzz both with generated inputs, then run the whole conversion check. These need the dev stack (`docker compose up -d`):
+
+```bash
+bin/compat run query
+bin/compat fuzz query
+bin/compat check query
+```
+
+### Benchmark
+
+```bash
+bin/compat bench query
+```
+
+This times every benchmark on PHP and on a release build of Rust, both in containers on the dev stack. It fails if Rust is slower. Add `--write` to record the run in [`tests/compat/query/bench.json`](https://github.com/appwrite/appwrite/blob/main/tests/compat/query/bench.json). Run it on a quiet machine, one library at a time.
 
 ## License
 

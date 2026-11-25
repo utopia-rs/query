@@ -9,6 +9,7 @@ use crate::builder::core::{
     AfterBuild, Builder, Dialect, ExistsSubquery, ExplainOptions, LateralJoin, SubSelect, WhereInSubquery,
 };
 use crate::builder::join::JoinBuilder;
+use crate::builder::steps::{Arg, Step};
 use crate::builder::types::{
     CteClause, Executor, JoinType, Statement, UnionClause, UnionType, WindowDefinition, WindowFrame, WindowSelect,
 };
@@ -24,10 +25,10 @@ fn strings<S: Into<String>>(items: impl IntoIterator<Item = S>) -> Vec<String> {
 }
 
 /// `/^[A-Za-z_][A-Za-z0-9_]*\s*\(\s*[A-Za-z0-9_,.\s*"`]*\s*\)$/` on the
-/// trimmed function (`$` also matches before a final newline).
+/// trimmed function, with `/D` (`$` only at the very end).
 fn is_window_function(function: &str) -> bool {
     let text = function.trim_matches([' ', '\t', '\n', '\r', '\0', '\x0B']);
-    let text = text.strip_suffix('\n').unwrap_or(text).as_bytes();
+    let text = text.as_bytes();
     let is_space = |b: u8| matches!(b, b' ' | b'\t' | b'\n' | b'\r' | b'\x0B' | b'\x0C');
     let mut i = 0;
     match text.first() {
@@ -53,12 +54,22 @@ impl<D: Dialect> Builder<D> {
     /// empty table makes a select without `FROM`.
     ///
     /// PHP: `from($table, $alias)`.
+    ///
+    /// On a builder with a [`Scope`](crate::builder::Scope), a non-empty
+    /// table is a collection id read through the scope (see
+    /// [`Builder::scope`]).
     pub fn from(&mut self, table: impl Into<String>, alias: impl Into<String>) -> &mut Self {
-        self.core.table = table.into();
-        self.core.alias = alias.into();
-        self.core.from_subquery = None;
-        self.core.tableless = self.core.table.is_empty();
-        self
+        self.scoped_from(table.into(), alias.into())
+    }
+
+    /// The refusal a call returning the builder kept for the next
+    /// statement, taken: PHP throws it from that call (`from()` of another
+    /// collection or alias on a bound builder, `into()` and the dialects'
+    /// multi-table writes once a collection is bound).
+    ///
+    /// PHP: `ScopesCollections::from()`, `requireUnbound()`.
+    pub fn take_refusal(&mut self) -> Option<crate::Error> {
+        self.core.deferred.take()
     }
 
     /// A select without `FROM`.
@@ -264,6 +275,14 @@ impl<D: Dialect> Builder<D> {
         &mut self,
         callback: impl Fn(Statement) -> Result<Statement> + Send + Sync + 'static,
     ) -> &mut Self {
+        self.after_build_owned(move |_, statement| callback(statement))
+    }
+
+    /// As [`Self::after_build`], with the [owner](Self::set_owner) of the builder that built.
+    pub fn after_build_owned(
+        &mut self,
+        callback: impl Fn(usize, Statement) -> Result<Statement> + Send + Sync + 'static,
+    ) -> &mut Self {
         let callback: AfterBuild = Arc::new(callback);
         self.core.after_build.push(callback);
         self
@@ -298,53 +317,83 @@ impl<D: Dialect> Builder<D> {
         self.build()?.execute()
     }
 
-    /// The select with its bindings inlined: strings quoted (`'` doubled),
+    /// The select with its bindings inlined: strings quoted by the dialect
+    /// (`'` doubled, and `\` doubled outside PostgreSQL and SQLite),
     /// numbers as PHP prints them, booleans as `1`/`0`, anything else `NULL`.
     /// For logs only: never execute it.
     ///
     /// PHP: `toRawSql()`.
     pub fn to_raw_sql(&mut self) -> Result<String> {
-        let result = self.build()?;
-        let mut sql = result.query.into_bytes();
+        self.raw_sql(false)
+    }
+
+    /// As [`Builder::to_raw_sql`], for a builder whose text holds a character for each
+    /// byte, as the PHP extension passes a string that is not UTF-8: the bytes of a
+    /// string binding are written the same way.
+    pub fn to_raw_sql_widened(&mut self) -> Result<String> {
+        self.raw_sql(true)
+    }
+
+    fn raw_sql(&mut self, widened: bool) -> Result<String> {
+        let result = self.built()?;
+        let mut sql = result.query;
         let mut offset = 0;
         for binding in &result.bindings {
-            let literal: Vec<u8> = match binding {
-                Value::Str(s) => {
-                    let mut out = Vec::with_capacity(s.len() + 2);
-                    out.push(b'\'');
-                    for &b in s.as_bytes() {
-                        if b == b'\'' {
-                            out.push(b'\'');
-                        }
-                        out.push(b);
-                    }
-                    out.push(b'\'');
-                    out
+            let literal = match binding {
+                Value::Str(s) if widened => {
+                    D::LITERAL.quote(&s.as_bytes().iter().map(|&b| char::from(b)).collect::<String>())?
                 }
-                Value::Int(_) | Value::Float(_) => crate::value::to_php_string(binding).into_bytes(),
-                Value::Bool(b) => {
-                    if *b {
-                        b"1".to_vec()
-                    } else {
-                        b"0".to_vec()
-                    }
-                }
-                _ => b"NULL".to_vec(),
+                Value::Str(s) => D::LITERAL.quote(&String::from_utf8_lossy(s.as_bytes()))?,
+                Value::Int(_) | Value::Float(_) => crate::value::to_php_string(binding),
+                Value::Bool(b) => if *b { "1" } else { "0" }.to_owned(),
+                _ => "NULL".to_owned(),
             };
-            if let Some(pos) =
-                sql.get(offset..).and_then(|rest| rest.iter().position(|&b| b == b'?')).map(|p| p + offset)
-            {
-                sql.splice(pos..pos + 1, literal.iter().copied());
+            if let Some(pos) = sql.get(offset..).and_then(|rest| rest.find('?')).map(|p| p + offset) {
+                sql.replace_range(pos..=pos, &literal);
                 offset = pos + literal.len();
             }
         }
-        Ok(String::from_utf8_lossy(&sql).into_owned())
+        Ok(sql)
+    }
+
+    /// The bindings so far, each with the column it was bound against.
+    ///
+    /// PHP: the protected `$bindings`.
+    pub fn binding_list(&self) -> &[crate::builder::Binding] {
+        &self.core.bindings
+    }
+
+    /// Replaces the bindings.
+    pub fn set_binding_list(&mut self, bindings: Vec<crate::builder::Binding>) -> &mut Self {
+        self.core.bindings = bindings;
+        self
+    }
+
+    /// Replaces the queries to compile.
+    ///
+    /// PHP: the protected `$pendingQueries`.
+    pub fn set_pending(&mut self, queries: Vec<Query>) -> &mut Self {
+        self.core.pending = queries;
+        self
+    }
+
+    /// The attributes resolved so far, and what each resolved to.
+    ///
+    /// PHP: the protected `$resolvedAttributeCache`.
+    pub fn resolved_attributes(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.core.resolved.iter().map(|(attribute, resolved)| (attribute.as_str(), resolved.as_str()))
+    }
+
+    /// Replaces the resolved attributes.
+    pub fn set_resolved_attributes(&mut self, resolved: impl IntoIterator<Item = (String, String)>) -> &mut Self {
+        self.core.resolved = resolved.into_iter().collect();
+        self
     }
 
     /// The bindings of the last statement built.
     ///
     /// PHP: `getBindings()`.
-    pub fn bindings(&self) -> Vec<Value> {
+    pub fn bindings(&mut self) -> Vec<Value> {
         self.binding_values()
     }
 
@@ -406,7 +455,7 @@ impl<D: Dialect> Builder<D> {
     ///
     /// PHP: `build()`.
     pub fn build(&mut self) -> Result<Statement> {
-        D::build(self)
+        self.scoped_build()
     }
 
     /// `count(attribute)` (`*` counts rows) as `alias`.
@@ -667,7 +716,9 @@ impl<D: Dialect> Builder<D> {
     ///
     /// PHP: `into()`.
     pub fn into(&mut self, table: impl Into<String>) -> &mut Self {
-        self.core.table = table.into();
+        let table = table.into();
+        self.defer_unbound(&format!("insert into table '{table}'"));
+        self.core.table = table;
         self
     }
 
@@ -717,6 +768,7 @@ impl<D: Dialect> Builder<D> {
     ///
     /// PHP: `insert()`.
     pub fn insert(&mut self) -> Result<Statement> {
+        self.check_deferred()?;
         D::insert(self)
     }
 
@@ -724,6 +776,7 @@ impl<D: Dialect> Builder<D> {
     ///
     /// PHP: `insertDefaultValues()`.
     pub fn insert_default_values(&mut self) -> Result<Statement> {
+        self.check_deferred()?;
         D::insert_default_values(self)
     }
 
@@ -731,6 +784,7 @@ impl<D: Dialect> Builder<D> {
     ///
     /// PHP: `insertSelect()`.
     pub fn insert_select(&mut self) -> Result<Statement> {
+        self.check_deferred()?;
         self.base_insert_select()
     }
 
@@ -738,6 +792,7 @@ impl<D: Dialect> Builder<D> {
     ///
     /// PHP: `update()`.
     pub fn update(&mut self) -> Result<Statement> {
+        self.check_deferred()?;
         D::update(self)
     }
 
@@ -745,6 +800,7 @@ impl<D: Dialect> Builder<D> {
     ///
     /// PHP: `delete()`.
     pub fn delete(&mut self) -> Result<Statement> {
+        self.check_deferred()?;
         D::delete(self)
     }
 
@@ -807,39 +863,39 @@ impl<D: Dialect> Builder<D> {
 
 impl<D: Dialect> Compiler for Builder<D> {
     fn compile_filter(&mut self, query: &Query) -> Result<String> {
-        D::compile_filter(self, query)
+        self.step_string(Step::CompileFilter, &[Arg::Query(query)])
     }
 
     fn compile_order(&mut self, query: &Query) -> Result<String> {
-        self.compile_order_query(query)
+        self.step_string(Step::CompileOrder, &[Arg::Query(query)])
     }
 
     fn compile_limit(&mut self, query: &Query) -> Result<String> {
-        Ok(self.compile_limit_query(query))
+        self.step_string(Step::CompileLimit, &[Arg::Query(query)])
     }
 
     fn compile_offset(&mut self, query: &Query) -> Result<String> {
-        Ok(self.compile_offset_query(query))
+        self.step_string(Step::CompileOffset, &[Arg::Query(query)])
     }
 
     fn compile_select(&mut self, query: &Query) -> Result<String> {
-        self.compile_select_query(query)
+        self.step_string(Step::CompileSelect, &[Arg::Query(query)])
     }
 
     fn compile_cursor(&mut self, query: &Query) -> Result<String> {
-        self.compile_cursor_query(query)
+        self.step_string(Step::CompileCursor, &[Arg::Query(query)])
     }
 
     fn compile_aggregate(&mut self, query: &Query) -> Result<String> {
-        self.compile_aggregate_query(query)
+        self.step_string(Step::CompileAggregate, &[Arg::Query(query)])
     }
 
     fn compile_group_by(&mut self, query: &Query) -> Result<String> {
-        self.compile_group_by_query(query)
+        self.step_string(Step::CompileGroupBy, &[Arg::Query(query)])
     }
 
     fn compile_join(&mut self, query: &Query) -> Result<String> {
-        self.compile_join_query(query)
+        self.step_string(Step::CompileJoin, &[Arg::Query(query)])
     }
 }
 

@@ -11,6 +11,7 @@ use crate::builder::feature::{
     Upsert, UpsertSelect,
 };
 use crate::builder::sql::{self, SqlDialect, distance_operator, wkt_of};
+use crate::builder::steps::{Arg, Step};
 use crate::builder::types::{Condition, Statement};
 use crate::error::{Error, Result};
 use crate::method::Method;
@@ -78,9 +79,9 @@ impl MySqlFamily for MySqlDialect {
     }
 }
 
-/// `/^[A-Za-z0-9_()=, \`.]+$/` (where `$` also matches before a final newline).
+/// `/^[A-Za-z0-9_()=, \`.]+$/D`.
 pub(crate) fn is_hint(hint: &str) -> bool {
-    let bytes = hint.strip_suffix('\n').unwrap_or(hint).as_bytes();
+    let bytes = hint.as_bytes();
     !bytes.is_empty()
         && bytes
             .iter()
@@ -134,6 +135,13 @@ pub(crate) fn search_expression<D: Dialect>(
     if sanitized.is_empty() {
         return Ok(if not { "1 = 1" } else { "1 = 0" }.into());
     }
+    if exact {
+        let words = split_search_words(&term);
+        let indexed: Vec<&str> = words.iter().map(String::as_str).filter(|word| is_indexed_search_word(word)).collect();
+        if !indexed.is_empty() {
+            return Ok(exact_search_expression(b, attribute, &words, &indexed, not));
+        }
+    }
     let sanitized = if exact { format!("\"{sanitized}\"") } else { format!("{sanitized}*") };
     b.add_binding(value::string(sanitized), None);
     Ok(if not {
@@ -141,6 +149,73 @@ pub(crate) fn search_expression<D: Dialect>(
     } else {
         format!("MATCH({attribute}) AGAINST(? IN BOOLEAN MODE)")
     })
+}
+
+/// InnoDB's `innodb_ft_min_token_size`: shorter words are not indexed.
+///
+/// PHP: `MySQL::FULL_TEXT_MINIMUM_WORD_LENGTH`.
+const FULL_TEXT_MINIMUM_WORD_LENGTH: usize = 3;
+
+/// InnoDB's default full-text stopwords, which are not indexed.
+///
+/// PHP: `MySQL::FULL_TEXT_STOPWORDS`.
+const FULL_TEXT_STOPWORDS: &[&str] = &[
+    "a", "about", "an", "are", "as", "at", "be", "by", "com", "de", "en", "for", "from", "how", "i", "in", "is", "it",
+    "la", "of", "on", "or", "that", "the", "this", "to", "was", "what", "when", "where", "who", "will", "with", "und",
+    "www",
+];
+
+/// An exact search that requires every indexed word through the full-text
+/// index and checks the words' order against the stored value: InnoDB loses
+/// phrase matches for rows whose transactions commit out of document ID
+/// order (MySQL bug #110448, also present in MariaDB).
+///
+/// PHP: `MySQL::compileExactSearchExpression()` (private).
+fn exact_search_expression<D: Dialect>(
+    b: &mut Builder<D>,
+    attribute: &str,
+    words: &[String],
+    indexed: &[&str],
+    not: bool,
+) -> String {
+    const SEPARATOR: &str = "[^[:alnum:]_]";
+    b.add_binding(value::string(format!("+{}", indexed.join(" +"))), None);
+    b.add_binding(
+        value::string(format!("(^|{SEPARATOR}){}({SEPARATOR}|$)", words.join(&format!("{SEPARATOR}+")))),
+        None,
+    );
+    let expression = format!("MATCH({attribute}) AGAINST(? IN BOOLEAN MODE) AND {attribute} REGEXP ?");
+    if not { format!("NOT ({expression})") } else { format!("({expression})") }
+}
+
+/// The words of a search term: runs of letters, numbers, `_` and `'`, with
+/// the quotes trimmed off their ends.
+///
+/// PHP: `MySQL::splitSearchWords()` (private).
+fn split_search_words(term: &str) -> Vec<String> {
+    use php_std::pcre::{PREG_SPLIT_NO_EMPTY, Value as PcreValue, preg_split};
+    let PcreValue::Array(pieces) = preg_split(br"/[^\p{L}\p{N}_']+/u", term.as_bytes(), -1, PREG_SPLIT_NO_EMPTY).value
+    else {
+        return Vec::new();
+    };
+    pieces
+        .entries()
+        .iter()
+        .filter_map(|(_, piece)| match piece {
+            PcreValue::Str(piece) => Some(String::from_utf8_lossy(piece).trim_matches('\'').to_owned()),
+            _ => None,
+        })
+        .filter(|word| !word.is_empty())
+        .collect()
+}
+
+/// Whether InnoDB indexes `word`: long enough and not a stopword.
+///
+/// PHP: `MySQL::isIndexedSearchWord()` (private).
+fn is_indexed_search_word(word: &str) -> bool {
+    php_std::mb::mb_strlen(word.as_bytes()) >= FULL_TEXT_MINIMUM_WORD_LENGTH
+        && !FULL_TEXT_STOPWORDS
+            .contains(&String::from_utf8_lossy(&php_std::mb::mb_strtolower(word.as_bytes())).as_ref())
 }
 
 /// MySQL's `build()`: the group-by modifier and the hints.
@@ -201,7 +276,7 @@ fn update_join<D: MySqlFamily>(b: &mut Builder<D>) -> Result<Statement> {
     }
     let mut sql = format!(
         "UPDATE {} JOIN {join} ON {} = {}",
-        b.quote(&b.core.table)?,
+        b.quote(&b.core.table.clone())?,
         b.resolve_and_wrap(&left)?,
         b.resolve_and_wrap(&right)?
     );
@@ -226,7 +301,7 @@ pub(crate) fn delete<D: MySqlFamily>(b: &mut Builder<D>) -> Result<Statement> {
     let sql = format!(
         "DELETE {} FROM {} AS {} JOIN {} ON {} = {}",
         b.quote(&alias)?,
-        b.quote(&b.core.table)?,
+        b.quote(&b.core.table.clone())?,
         b.quote(&alias)?,
         b.quote(&table)?,
         b.resolve_and_wrap(&left)?,
@@ -253,13 +328,13 @@ pub(crate) fn insert_or_ignore<D: Dialect>(b: &mut Builder<D>) -> Result<Stateme
 pub(crate) fn insert_default_values<D: Dialect>(b: &mut Builder<D>) -> Result<Statement> {
     b.core.bindings.clear();
     b.validate_table()?;
-    let sql = format!("INSERT INTO {} () VALUES ()", b.quote(&b.core.table)?);
+    let sql = format!("INSERT INTO {} () VALUES ()", b.quote(&b.core.table.clone())?);
     Ok(b.statement(sql))
 }
 
 /// `EXPLAIN [ANALYZE] [FORMAT=...]`.
 pub(crate) fn explain<D: Dialect>(b: &mut Builder<D>, analyze: bool, options: &ExplainOptions) -> Result<Statement> {
-    let result = D::build(b)?;
+    let result = b.built()?;
     let mut prefix = "EXPLAIN".to_owned();
     if analyze {
         prefix.push_str(" ANALYZE");
@@ -281,7 +356,7 @@ pub(crate) fn explain<D: Dialect>(b: &mut Builder<D>, analyze: bool, options: &E
 pub(crate) fn reset<D: MySqlFamily>(b: &mut Builder<D>) {
     b.core.hints.clear();
     b.core.json_sets.clear();
-    b.core.group_by_modifier = None;
+    b.reset_group_by_modifier();
     *D::mysql_mut(b) = MySqlState::default();
 }
 
@@ -292,18 +367,19 @@ pub(crate) fn spatial_distance<D: MySqlFamily>(
     attribute: &str,
     values: &Array,
 ) -> Result<String> {
-    let filter = sql::distance_filter(values, "Builder/MySQL.php", 432)?;
-    let wkt = wkt_of(&filter.geometry, MYSQL_CLASS)?;
+    let filter = sql::distance_filter(values, "Builder/MySQL.php", 484)?;
+    let wkt = wkt_of(b, &filter.geometry)?;
     let operator = distance_operator(method);
     b.add_binding(wkt, None);
     b.add_binding(Value::Float(filter.distance), None);
     if filter.meters {
         return Ok(format!(
             "ST_Distance(ST_SRID({attribute}, 4326), {}, 'metre') {operator} ?",
-            D::geom_from_text(4326)
+            b.step_string(Step::GeomFromText, &[Arg::Int(Some(4326))])?
         ));
     }
-    Ok(format!("ST_Distance(ST_SRID({attribute}, 0), {}) {operator} ?", D::geom_from_text(0)))
+    let geometry = b.step_string(Step::GeomFromText, &[Arg::Int(Some(0))])?;
+    Ok(format!("ST_Distance(ST_SRID({attribute}, 0), {geometry}) {operator} ?"))
 }
 
 /// `function(attribute, ST_GeomFromText(?, 4326, ...))`, negated with `NOT`.
@@ -314,9 +390,10 @@ pub(crate) fn spatial_predicate<D: MySqlFamily>(
     values: &Array,
     not: bool,
 ) -> Result<String> {
-    let wkt = sql::predicate_wkt(values, MYSQL_CLASS, "Builder/MySQL.php", 461)?;
+    let wkt = sql::predicate_wkt(b, values, MYSQL_CLASS, "Builder/MySQL.php", 513)?;
     b.add_binding(value::string(wkt), None);
-    let expression = format!("{function}({attribute}, {})", D::geom_from_text(4326));
+    let geometry = b.step_string(Step::GeomFromText, &[Arg::Int(Some(4326))])?;
+    let expression = format!("{function}({attribute}, {geometry})");
     Ok(if not { format!("NOT {expression}") } else { expression })
 }
 
@@ -348,6 +425,23 @@ pub(crate) fn json_path<D: Dialect>(b: &mut Builder<D>, attribute: &str, values:
 
 impl Dialect for MySqlDialect {
     const CLASS: &'static str = "Utopia\\Query\\Builder\\MySQL";
+    const LIKE_ESCAPE: u8 = b'!';
+    const DECLARES_LIKE_ESCAPE: bool = true;
+
+    fn base_step(
+        b: &mut Builder<Self>,
+        step: crate::builder::Step,
+        arguments: &[crate::builder::Arg<'_>],
+    ) -> Option<Result<crate::builder::Ret>> {
+        sql::sql_base_step(b, step, arguments)
+            .or_else(|| crate::builder::feature::aggregates_base_step::<Self>(step, arguments))
+            .or_else(|| match (step, arguments) {
+                (crate::builder::Step::GeomFromText, [crate::builder::Arg::Int(Some(srid))]) => {
+                    Some(Ok(crate::builder::Ret::Str(Self::geom_from_text(*srid))))
+                }
+                _ => None,
+            })
+    }
 
     fn compile_random(_b: &Builder<Self>) -> String {
         "RAND()".into()
@@ -356,6 +450,18 @@ impl Dialect for MySqlDialect {
     fn compile_regex(b: &mut Builder<Self>, attribute: &str, values: &Array, column: Option<&str>) -> Result<String> {
         b.add_binding(crate::builder::core::first(values), column);
         Ok(format!("{attribute} REGEXP ?"))
+    }
+
+    fn compile_contains_all(
+        b: &mut Builder<Self>,
+        attribute: &str,
+        values: &Array,
+        column: Option<&str>,
+    ) -> Result<String> {
+        if let Some(sql) = b.flavored_contains_all(attribute, values, column) {
+            return Ok(sql);
+        }
+        b.base_compile_contains_all(attribute, values, column)
     }
 
     fn compile_filter(b: &mut Builder<Self>, query: &Query) -> Result<String> {
@@ -393,7 +499,10 @@ impl Dialect for MySqlDialect {
 
 impl SqlDialect for MySqlDialect {
     fn compile_search_expression(b: &mut Builder<Self>, attribute: &str, values: &Array, not: bool) -> Result<String> {
-        search_expression(b, attribute, values, not)
+        match b.flavored_search_values(values) {
+            Some(values) => search_expression(b, attribute, &values, not),
+            None => search_expression(b, attribute, values, not),
+        }
     }
 
     fn compile_spatial_distance(
@@ -421,7 +530,16 @@ impl SqlDialect for MySqlDialect {
         values: &Array,
         not: bool,
     ) -> Result<String> {
-        spatial_predicate(b, "ST_Contains", attribute, values, not)
+        // Through the step, so a subclass's compileSpatialPredicate() writes this one too.
+        b.step_string(
+            crate::builder::Step::CompileSpatialPredicate,
+            &[
+                crate::builder::Arg::Str("ST_Contains"),
+                crate::builder::Arg::Str(attribute),
+                crate::builder::Arg::Values(values),
+                crate::builder::Arg::Bool(not),
+            ],
+        )
     }
 
     fn compile_json_contains_expression(
@@ -452,8 +570,15 @@ impl SqlDialect for MySqlDialect {
 
 /// The SQL of a conflict clause for a SQL dialect.
 pub(crate) fn conflict_clause<D: SqlDialect>(b: &mut Builder<D>) -> Result<String> {
-    let header = D::compile_conflict_header(b)?;
-    b.compile_conflict_clause(&header, D::compile_conflict_assignment)
+    b.step_string(Step::CompileConflictClause, &[])
+}
+
+/// The builder's own `compileConflictClause()`.
+pub(crate) fn base_conflict_clause<D: SqlDialect>(b: &mut Builder<D>) -> Result<String> {
+    b.compile_conflict_clause(
+        |b| b.step_string(Step::CompileConflictHeader, &[]),
+        |b, wrapped| b.step_string(Step::CompileConflictAssignment, &[Arg::Str(wrapped)]),
+    )
 }
 
 /// MySQL's JSON column updates, shared with MariaDB.
@@ -501,8 +626,12 @@ pub(crate) mod json_sets {
         b.core.json_sets.set(
             column,
             Condition::new(
-                format!("JSON_REMOVE({wrapped}, JSON_UNQUOTE(JSON_SEARCH({wrapped}, 'one', ?)))"),
-                vec![value],
+                // The value is a LIKE pattern to JSON_SEARCH, and a value that is not there removes nothing.
+                format!(
+                    "COALESCE(JSON_REMOVE({wrapped}, JSON_UNQUOTE(JSON_SEARCH({wrapped}, 'one', ?, {}))), {wrapped})",
+                    D::LITERAL.quote(&char::from(D::LIKE_ESCAPE).to_string())?
+                ),
+                vec![crate::value::string(crate::builder::core::escape_like_value(&value, D::LIKE_ESCAPE))],
             ),
         );
         Ok(())
@@ -655,7 +784,9 @@ impl<D: MySqlFamily> Builder<D> {
         right: impl Into<String>,
         alias: impl Into<String>,
     ) -> &mut Self {
-        D::mysql_mut(self).update_join = Some((table.into(), left.into(), right.into(), alias.into()));
+        let table = table.into();
+        self.defer_unbound(&format!("update joining table '{table}'"));
+        D::mysql_mut(self).update_join = Some((table, left.into(), right.into(), alias.into()));
         self
     }
 
@@ -669,7 +800,9 @@ impl<D: MySqlFamily> Builder<D> {
         left: impl Into<String>,
         right: impl Into<String>,
     ) -> &mut Self {
-        D::mysql_mut(self).delete_join = Some((alias.into(), table.into(), left.into(), right.into()));
+        let table = table.into();
+        self.defer_unbound(&format!("delete joining table '{table}'"));
+        D::mysql_mut(self).delete_join = Some((alias.into(), table, left.into(), right.into()));
         self
     }
 

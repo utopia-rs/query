@@ -29,6 +29,7 @@
 //! | `Feature\MariaDB\Returning`, `Feature\PostgreSQL\Returning` | [`Returning`] |
 
 use crate::builder::core::{Builder, Dialect};
+use crate::builder::steps::{Arg, Ret, Step};
 use crate::builder::types::{ColumnPredicate, Condition, LockMode, Statement};
 use crate::builder::{AnyBuilder, CaseExpression, JoinType};
 use crate::error::{Error, Result};
@@ -112,6 +113,16 @@ pub trait ConditionalAggregates: Dialect {
     }
 }
 
+/// The builder's own `groupConcatExpr()`, `jsonArrayAggExpr()` and `jsonObjectAggExpr()`.
+pub(crate) fn aggregates_base_step<D: StringAggregates>(step: Step, arguments: &[Arg<'_>]) -> Option<Result<Ret>> {
+    Some(Ok(Ret::Str(match (step, arguments) {
+        (Step::GroupConcatExpr, [Arg::Str(column), Arg::Str(order_by)]) => D::group_concat_expr(column, order_by),
+        (Step::JsonArrayAggExpr, [Arg::Str(column)]) => D::json_array_agg_expr(column),
+        (Step::JsonObjectAggExpr, [Arg::Str(key), Arg::Str(value)]) => D::json_object_agg_expr(key, value),
+        _ => return None,
+    })))
+}
+
 /// `GROUP_CONCAT` / `STRING_AGG`, `JSON_ARRAYAGG`, `JSON_OBJECTAGG`.
 pub trait StringAggregates: Dialect {
     /// The concatenation of `column` (wrapped) with an `ORDER BY` fragment.
@@ -184,15 +195,15 @@ pub trait TableSampling: Dialect {
 /// `nextVal()` and `currVal()` of sequences.
 pub trait Sequences: Dialect {
     /// The select expression of `function` (`next` or `current`) on `sequence` (validated).
-    fn sequence_expression(b: &Builder<Self>, next: bool, sequence: &str) -> Result<String>;
+    fn sequence_expression(b: &mut Builder<Self>, next: bool, sequence: &str) -> Result<String>;
 }
 
 /// `RETURNING` after inserts, updates and deletes.
 pub trait Returning: Dialect {}
 
-/// `/^[a-zA-Z_][a-zA-Z0-9_]*$/` (where `$` also matches before a final newline).
+/// `/^[a-zA-Z_][a-zA-Z0-9_]*$/D`.
 pub(crate) fn is_plain_identifier(name: &str) -> bool {
-    let bytes = name.strip_suffix('\n').unwrap_or(name).as_bytes();
+    let bytes = name.as_bytes();
     match bytes.split_first() {
         Some((first, rest)) => {
             (first.is_ascii_alphabetic() || *first == b'_')
@@ -202,10 +213,10 @@ pub(crate) fn is_plain_identifier(name: &str) -> bool {
     }
 }
 
-/// `/^[A-Za-z_][A-Za-z0-9_]*(\s+[A-Za-z_][A-Za-z0-9_]*)*(\s*\(\s*[A-Za-z0-9_,\s]+\s*\))?$/`:
+/// `/^[A-Za-z_][A-Za-z0-9_]*(\s+[A-Za-z_][A-Za-z0-9_]*)*(\s*\(\s*[A-Za-z0-9_,\s]+\s*\))?$/D`:
 /// a type name of words, with an optional parenthesised argument list.
 pub(crate) fn is_cast_type(text: &str) -> bool {
-    let text = text.strip_suffix('\n').unwrap_or(text).as_bytes();
+    let text = text.as_bytes();
     let is_space = |b: u8| matches!(b, b' ' | b'\t' | b'\n' | b'\r' | b'\x0B' | b'\x0C');
     let word_start = |b: u8| b.is_ascii_alphabetic() || b == b'_';
     let word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
@@ -320,7 +331,7 @@ impl<D: Transactions> Builder<D> {
     /// `SAVEPOINT name`.
     ///
     /// PHP: `savepoint()`.
-    pub fn savepoint(&self, name: &str) -> Result<Statement> {
+    pub fn savepoint(&mut self, name: &str) -> Result<Statement> {
         Ok(Statement::with_parts(
             format!("SAVEPOINT {}", self.quote(name)?),
             Vec::new(),
@@ -333,7 +344,7 @@ impl<D: Transactions> Builder<D> {
     /// `RELEASE SAVEPOINT name`.
     ///
     /// PHP: `releaseSavepoint()`.
-    pub fn release_savepoint(&self, name: &str) -> Result<Statement> {
+    pub fn release_savepoint(&mut self, name: &str) -> Result<Statement> {
         Ok(Statement::with_parts(
             format!("RELEASE SAVEPOINT {}", self.quote(name)?),
             Vec::new(),
@@ -346,7 +357,7 @@ impl<D: Transactions> Builder<D> {
     /// `ROLLBACK TO SAVEPOINT name`.
     ///
     /// PHP: `rollbackToSavepoint()`.
-    pub fn rollback_to_savepoint(&self, name: &str) -> Result<Statement> {
+    pub fn rollback_to_savepoint(&mut self, name: &str) -> Result<Statement> {
         Ok(Statement::with_parts(
             format!("ROLLBACK TO SAVEPOINT {}", self.quote(name)?),
             Vec::new(),
@@ -747,7 +758,8 @@ impl<D: StringAggregates> Builder<D> {
             Some(columns) if !columns.is_empty() => format!("ORDER BY {}", self.compile_order_by_list(columns)?),
             _ => String::new(),
         };
-        let mut expression = D::group_concat_expr(&self.resolve_and_wrap(column)?, &order);
+        let wrapped = self.resolve_and_wrap(column)?;
+        let mut expression = self.step_string(Step::GroupConcatExpr, &[Arg::Str(&wrapped), Arg::Str(&order)])?;
         if !alias.is_empty() {
             expression.push_str(" AS ");
             expression.push_str(&self.quote(alias)?);
@@ -759,7 +771,8 @@ impl<D: StringAggregates> Builder<D> {
     ///
     /// PHP: `jsonArrayAgg()`.
     pub fn json_array_agg(&mut self, column: &str, alias: &str) -> Result<&mut Self> {
-        let mut expression = D::json_array_agg_expr(&self.resolve_and_wrap(column)?);
+        let wrapped = self.resolve_and_wrap(column)?;
+        let mut expression = self.step_string(Step::JsonArrayAggExpr, &[Arg::Str(&wrapped)])?;
         if !alias.is_empty() {
             expression.push_str(" AS ");
             expression.push_str(&self.quote(alias)?);
@@ -773,7 +786,7 @@ impl<D: StringAggregates> Builder<D> {
     pub fn json_object_agg(&mut self, key_column: &str, value_column: &str, alias: &str) -> Result<&mut Self> {
         let key = self.resolve_and_wrap(key_column)?;
         let value = self.resolve_and_wrap(value_column)?;
-        let mut expression = D::json_object_agg_expr(&key, &value);
+        let mut expression = self.step_string(Step::JsonObjectAggExpr, &[Arg::Str(&key), Arg::Str(&value)])?;
         if !alias.is_empty() {
             expression.push_str(" AS ");
             expression.push_str(&self.quote(alias)?);
@@ -911,6 +924,7 @@ impl<D: Upsert> Builder<D> {
     ///
     /// PHP: `upsert()`.
     pub fn upsert(&mut self) -> Result<Statement> {
+        self.check_deferred()?;
         D::upsert(self)
     }
 }
@@ -920,6 +934,7 @@ impl<D: UpsertSelect> Builder<D> {
     ///
     /// PHP: `upsertSelect()`.
     pub fn upsert_select(&mut self) -> Result<Statement> {
+        self.check_deferred()?;
         D::upsert_select(self)
     }
 }
@@ -929,6 +944,7 @@ impl<D: InsertOrIgnore> Builder<D> {
     ///
     /// PHP: `insertOrIgnore()`.
     pub fn insert_or_ignore(&mut self) -> Result<Statement> {
+        self.check_deferred()?;
         D::insert_or_ignore(self)
     }
 }
@@ -988,7 +1004,8 @@ impl<D: Returning> Builder<D> {
 impl<D: Spatial> Builder<D> {
     /// The distance from `point` (`[x, y]`) compares to `distance` with
     /// `operator` (`<`, `>`, `=`, `!=`; anything else is `<`), in meters when
-    /// `meters`.
+    /// `meters`. Fails with [`Error::Validation`](crate::Error::Validation)
+    /// unless `point` is an `[x, y]` pair of finite numbers.
     ///
     /// PHP: `filterDistance()`.
     pub fn filter_distance(
@@ -998,11 +1015,9 @@ impl<D: Spatial> Builder<D> {
         operator: &str,
         distance: f64,
         meters: bool,
-    ) -> &mut Self {
-        let coordinate = |i: i64| {
-            php_std::number::to_string(point.get(&php_std::ArrayKey::Int(i)).map(Value::to_double).unwrap_or(0.0))
-        };
-        let wkt = format!("POINT({} {})", coordinate(0), coordinate(1));
+    ) -> crate::Result<&mut Self> {
+        let point = Value::Array(point.clone());
+        let wkt = format!("POINT({})", crate::builder::sql::point_wkt(Some(&point))?);
         let method = match operator {
             ">" => crate::Method::DistanceGreaterThan,
             "=" => crate::Method::DistanceEqual,
@@ -1011,7 +1026,7 @@ impl<D: Spatial> Builder<D> {
         };
         let tuple = crate::value::list([crate::value::string(wkt), Value::Float(distance), Value::Bool(meters)]);
         self.core.pending.push(Query::new(method, attribute, crate::value::list([Value::Array(tuple)]), ""));
-        self
+        Ok(self)
     }
 
     /// The geometry column intersects `geometry`.

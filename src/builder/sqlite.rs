@@ -4,7 +4,7 @@
 //!
 //! PHP: `Utopia\Query\Builder\SQLite`.
 
-use crate::builder::core::{Builder, Dialect};
+use crate::builder::core::{Builder, Dialect, quote_bytes};
 use crate::builder::feature::{
     BitwiseAggregates, ConditionalAggregates, CrossJoins, InsertOrIgnore, Json, Locking, RawSql, StatisticalAggregates,
     StringAggregates, Transactions, Upsert, UpsertSelect,
@@ -70,18 +70,86 @@ fn json_each_conditions(b: &mut Builder<SqliteDialect>, attribute: &str, values:
 
 impl Dialect for SqliteDialect {
     const CLASS: &'static str = "Utopia\\Query\\Builder\\SQLite";
+    const DECLARES_LIKE_ESCAPE: bool = true;
+    const IMPLICIT_LIKE_ESCAPE: Option<u8> = None;
+    const LITERAL: crate::StringLiteral = crate::StringLiteral::Standard;
+
+    fn base_step(
+        b: &mut Builder<Self>,
+        step: crate::builder::Step,
+        arguments: &[crate::builder::Arg<'_>],
+    ) -> Option<Result<crate::builder::Ret>> {
+        sql::sql_base_step(b, step, arguments)
+            .or_else(|| crate::builder::feature::aggregates_base_step::<Self>(step, arguments))
+    }
+
+    fn quote_string(value: &[u8]) -> Vec<u8> {
+        quote_bytes(value, false)
+    }
 
     fn compile_random(_b: &Builder<Self>) -> String {
         "RANDOM()".into()
     }
 
-    fn compile_regex(
-        _b: &mut Builder<Self>,
-        _attribute: &str,
-        _values: &Array,
-        _column: Option<&str>,
+    fn compile_regex(b: &mut Builder<Self>, attribute: &str, values: &Array, column: Option<&str>) -> Result<String> {
+        if b.core.flavor.sqlite.is_none() {
+            return Err(Error::Unsupported("REGEXP is not natively supported in SQLite.".into()));
+        }
+        b.add_binding(crate::builder::core::first(values), column);
+        Ok(format!("{attribute} REGEXP ?"))
+    }
+
+    fn compile_like(
+        b: &mut Builder<Self>,
+        attribute: &str,
+        values: &Array,
+        prefix: &str,
+        suffix: &str,
+        not: bool,
+        column: Option<&str>,
     ) -> Result<String> {
-        Err(Error::Unsupported("REGEXP is not natively supported in SQLite.".into()))
+        if b.core.flavor.sqlite.is_none() {
+            return b.base_compile_like(attribute, values, prefix, suffix, not, column);
+        }
+        b.sqlite_like(attribute, values, prefix, suffix, not, column)
+    }
+
+    fn compile_contains(
+        b: &mut Builder<Self>,
+        attribute: &str,
+        values: &Array,
+        column: Option<&str>,
+    ) -> Result<String> {
+        if b.core.flavor.sqlite.is_none() {
+            return b.base_compile_contains(attribute, values, column);
+        }
+        let predicates = b.sqlite_substrings(attribute, values, false, column)?;
+        Ok(if predicates.len() == 1 { predicates[0].clone() } else { format!("({})", predicates.join(" OR ")) })
+    }
+
+    fn compile_contains_all(
+        b: &mut Builder<Self>,
+        attribute: &str,
+        values: &Array,
+        column: Option<&str>,
+    ) -> Result<String> {
+        if b.core.flavor.sqlite.is_none() {
+            return b.base_compile_contains_all(attribute, values, column);
+        }
+        Ok(format!("({})", b.sqlite_substrings(attribute, values, false, column)?.join(" AND ")))
+    }
+
+    fn compile_not_contains(
+        b: &mut Builder<Self>,
+        attribute: &str,
+        values: &Array,
+        column: Option<&str>,
+    ) -> Result<String> {
+        if b.core.flavor.sqlite.is_none() {
+            return b.base_compile_not_contains(attribute, values, column);
+        }
+        let predicates = b.sqlite_substrings(attribute, values, true, column)?;
+        Ok(if predicates.len() == 1 { predicates[0].clone() } else { format!("({})", predicates.join(" AND ")) })
     }
 
     fn compile_filter(b: &mut Builder<Self>, query: &Query) -> Result<String> {
@@ -156,12 +224,33 @@ impl SqlDialect for SqliteDialect {
         values: &Array,
         not: bool,
     ) -> Result<String> {
+        if b.core.flavor.sqlite.is_some() {
+            let needles = crate::builder::core::first(values);
+            let expression = format!("({})", b.sqlite_element_matches(attribute, &needles)?.join(" AND "));
+            return Ok(if not { format!("({attribute} IS NOT NULL AND NOT {expression})") } else { expression });
+        }
         let expression = json_each_conditions(b, attribute, values, " AND ");
         Ok(if not { format!("NOT {expression}") } else { expression })
     }
 
     fn compile_json_overlaps_expression(b: &mut Builder<Self>, attribute: &str, values: &Array) -> Result<String> {
+        if b.core.flavor.sqlite.is_some() {
+            let needles = crate::builder::core::first(values);
+            return Ok(format!("({})", b.sqlite_element_matches(attribute, &needles)?.join(" OR ")));
+        }
         Ok(json_each_conditions(b, attribute, values, " OR "))
+    }
+
+    fn compile_array_filter(b: &mut Builder<Self>, method: Method, attribute: &str, query: &Query) -> Result<String> {
+        if b.core.flavor.sqlite.is_some() && method == Method::NotContains {
+            let wrapped = value::list([Value::Array(query.values().clone())]);
+            let overlaps = b.step_string(
+                crate::builder::Step::CompileJsonOverlapsExpression,
+                &[crate::builder::Arg::Str(attribute), crate::builder::Arg::Values(&wrapped)],
+            )?;
+            return Ok(format!("({attribute} IS NOT NULL AND NOT {overlaps})"));
+        }
+        sql::sql_compile_array_filter(b, method, attribute, query)
     }
 
     fn compile_json_path_expression(b: &mut Builder<Self>, attribute: &str, values: &Array) -> Result<String> {
